@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.venv/
+*.pyc
+
+# Local data and model artifacts
+resources/eval_dataset/raw/*
+resources/model_weights/raw/*
+resources/ppu_docs/raw/*
+artifacts/*
+benchmarks/output/*
+reports/output/*
+
+# Keep placeholders
+!resources/eval_dataset/raw/README.md
+!resources/model_weights/raw/README.md
+!resources/ppu_docs/raw/README.md
+!artifacts/README.md
+!benchmarks/README.md
+!benchmarks/output/README.md
+!reports/README.md
+!reports/output/README.md
