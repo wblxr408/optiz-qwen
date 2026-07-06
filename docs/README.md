@@ -9,6 +9,21 @@
 - 同时覆盖模型压缩、系统调度、算子融合、内存管理、硬件适配
 - 输出真实源代码、性能对比结果和技术报告
 
+## 当前基线入口
+
+主办方公开给出的 DNDX 选手资料已并入当前仓库，基线评测入口收敛为：
+
+- 根目录 `benchmark_public.py`：兼容主办方自测命令
+- 根目录 `evaluation_wrapper.py`：兼容主办方提交接口
+- `src/optiz_qwen/evaluation/dndx_public_benchmark.py`：仓库内维护实现
+- `src/optiz_qwen/evaluation/dndx_wrapper.py`：仓库内维护实现
+
+公开自测资源路径统一为：
+
+- 数据集：`resources/eval_dataset/raw/mmbench_public/`
+- 模型目录：`resources/model_weights/raw/Qwen3.5-2B/`
+- 输出结果：`benchmarks/output/`
+
 ## 技术路线初版
 
 - 视觉压缩：`FastV` 风格层间视觉 Token 剪枝
