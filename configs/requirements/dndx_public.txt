@@ -1,2 +1,4 @@
-pillow
+torch
 transformers
+Pillow
+numpy

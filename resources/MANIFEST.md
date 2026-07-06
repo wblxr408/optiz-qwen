@@ -13,8 +13,9 @@ This repository intentionally does not vendor large external assets. The followi
 2. Qwen3.5-2B model weights
 - Purpose: baseline deployment and all optimization work
 - Expected landing path: `resources/model_weights/raw/Qwen3.5-2B/`
-- Expected source: official model release path chosen by the team
-- Current state: not downloaded
+- Expected source: ModelScope `Qwen/Qwen3.5-2B`
+- Official URL: https://www.modelscope.cn/models/Qwen/Qwen3.5-2B
+- Current state: downloaded locally under the expected raw-resource path; ignored by Git
 
 3. PPU reference materials
 - Purpose: operator support mapping, runtime constraints, and packing/layout decisions
@@ -36,3 +37,5 @@ This repository intentionally does not vendor large external assets. The followi
 
 - 2026-07-06: the imported `dndx_participant` public self-test TSV files were normalized from `dndx_participant/datasets/mmbench/` to `resources/eval_dataset/raw/mmbench_public/`.
 - 2026-07-06: the local model placeholder path was normalized from `./Qwen3.5-2B` to `resources/model_weights/raw/Qwen3.5-2B/`.
+- 2026-07-06: teacher-provided model source confirmed as ModelScope `Qwen/Qwen3.5-2B`; page reports 2.27B parameters and approximately 4.57 GB total files.
+- 2026-07-06: ModelScope snapshot downloaded locally to `resources/model_weights/raw/Qwen3.5-2B/`; the raw model directory remains ignored by Git.
