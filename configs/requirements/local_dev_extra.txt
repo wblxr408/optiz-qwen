@@ -2,3 +2,4 @@
 modelscope
 torchvision
 accelerate
+matplotlib

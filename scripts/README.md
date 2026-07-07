@@ -38,3 +38,49 @@ conda run -n optiz-qwen bash scripts/download_qwen35_2b_modelscope.sh
 ```
 
 The target directory is `resources/model_weights/raw/Qwen3.5-2B/`.
+
+## Benchmark comparison
+
+Compare DNDX benchmark JSON files. The script prints aggregate metrics as
+tables and generates a per-sample PNG chart.
+
+For daily use, pass only the candidate result you want to compare. The default
+baseline paths are hard-coded as:
+
+- `benchmarks/output/result_dev_en_20_mps.json`
+- `benchmarks/output/result_dev_cn_20_mps.json`
+
+Compare only the English result:
+
+```bash
+python scripts/compare_benchmarks.py \
+  --candidate-name after \
+  --candidate en=benchmarks/output/after_en.json \
+  --plot benchmarks/output/compare_en.png
+```
+
+Compare only the Chinese result:
+
+```bash
+python scripts/compare_benchmarks.py \
+  --candidate-name after \
+  --candidate cn=benchmarks/output/after_cn.json \
+  --plot benchmarks/output/compare_cn.png
+```
+
+You can still compare both datasets or override every path explicitly:
+
+```bash
+python scripts/compare_benchmarks.py \
+  --baseline-name before \
+  --candidate-name after \
+  --baseline en=benchmarks/output/before_en.json \
+  --baseline cn=benchmarks/output/before_cn.json \
+  --candidate en=benchmarks/output/after_en.json \
+  --candidate cn=benchmarks/output/after_cn.json \
+  --plot benchmarks/output/compare_before_after.png
+```
+
+Only the JSON format matters; file names are up to each developer. The PNG
+visualizes per-sample answer status changes, validation errors, TTFT deltas,
+throughput deltas, and generated-token deltas.
