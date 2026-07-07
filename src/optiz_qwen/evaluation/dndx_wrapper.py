@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -90,20 +92,51 @@ class VLMModel:
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
+        # Keep Windows console progress output readable by forcing ASCII bars.
+        os.environ.setdefault("TQDM_ASCII", "1")
+        self._install_transformers_log_filters()
+        normalized_device = (self.device or "auto").strip().lower()
+        dtype = torch.float32 if normalized_device == "cpu" else torch.bfloat16
         self._torch = torch
         self._processor = AutoProcessor.from_pretrained(
             self.model_path,
             local_files_only=True,
             trust_remote_code=True,
         )
+        model_kwargs = {
+            "local_files_only": True,
+            "trust_remote_code": True,
+            "dtype": dtype,
+        }
+        # Keep the baseline CPU path usable without forcing accelerate/device_map.
+        if normalized_device == "auto":
+            model_kwargs["device_map"] = "auto"
         self._model = AutoModelForImageTextToText.from_pretrained(
             self.model_path,
-            local_files_only=True,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            device_map=self.device,
-        ).eval()
+            **model_kwargs,
+        )
+        if normalized_device not in {"", "auto"}:
+            self._model = self._model.to(torch.device(normalized_device))
+        self._model = self._model.eval()
         self._tokenizer = getattr(self._processor, "tokenizer", None)
+
+    def _install_transformers_log_filters(self) -> None:
+        class _MessageFilter(logging.Filter):
+            def __init__(self, blocked_substrings: tuple[str, ...]) -> None:
+                super().__init__()
+                self.blocked_substrings = blocked_substrings
+
+            def filter(self, record: logging.LogRecord) -> bool:
+                message = record.getMessage()
+                return not any(token in message for token in self.blocked_substrings)
+
+        qwen_logger = logging.getLogger("transformers.models.qwen3_5.modeling_qwen3_5")
+        if not any(getattr(f, "_optiz_qwen_fast_path", False) for f in qwen_logger.filters):
+            fast_path_filter = _MessageFilter(
+                ("The fast path is not available because one of the required library is not installed.",)
+            )
+            fast_path_filter._optiz_qwen_fast_path = True
+            qwen_logger.addFilter(fast_path_filter)
 
     def _load_dummy_backend(self, reason: str) -> None:
         self._dummy_reason = reason
@@ -141,12 +174,13 @@ class VLMModel:
         generation_kwargs = {
             **inputs,
             "max_new_tokens": generation_config.max_new_tokens,
-            "temperature": generation_config.temperature,
-            "top_p": generation_config.top_p,
             "do_sample": generation_config.temperature > 0,
             "use_cache": True,
             "streamer": streamer,
         }
+        if generation_config.temperature > 0:
+            generation_kwargs["temperature"] = generation_config.temperature
+            generation_kwargs["top_p"] = generation_config.top_p
 
         output_holder: dict[str, Any] = {}
 
