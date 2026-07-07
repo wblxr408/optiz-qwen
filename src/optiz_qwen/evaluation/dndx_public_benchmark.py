@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--warmup-samples", type=int, default=2)
+    parser.add_argument("--max-new-tokens", type=int, default=64)
     return parser.parse_args()
 
 
@@ -119,8 +120,8 @@ def build_prompt(sample: Sample) -> str:
     )
 
 
-def fixed_generation_config() -> GenerationConfig:
-    return GenerationConfig(max_new_tokens=64, temperature=0.0, top_p=1.0)
+def fixed_generation_config(max_new_tokens: int = 64) -> GenerationConfig:
+    return GenerationConfig(max_new_tokens=max_new_tokens, temperature=0.0, top_p=1.0)
 
 
 def extract_answer(text: str) -> str | None:
@@ -210,7 +211,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             image=decode_image(sample.image_b64),
             prompt=build_prompt(sample),
             choices=sample.choices,
-            generation_config=fixed_generation_config(),
+            generation_config=fixed_generation_config(args.max_new_tokens),
             sample_id=sample.sample_id,
         )
         settle_runtime(model)
@@ -223,7 +224,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     for sample in samples:
         settle_runtime(model)
-        config = fixed_generation_config()
+        config = fixed_generation_config(args.max_new_tokens)
         result = model.generate_with_metrics(
             image=decode_image(sample.image_b64),
             prompt=build_prompt(sample),

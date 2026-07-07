@@ -50,6 +50,7 @@ class VLMModel:
         self._processor = None
         self._tokenizer = None
         self._backend_name = "dummy"
+        self._kivi_config = None
 
         if backend in {"auto", "transformers"}:
             try:
@@ -178,6 +179,9 @@ class VLMModel:
             "use_cache": True,
             "streamer": streamer,
         }
+        kivi_cache = self._build_kivi_cache_if_enabled()
+        if kivi_cache is not None:
+            generation_kwargs["past_key_values"] = kivi_cache
         if generation_config.temperature > 0:
             generation_kwargs["temperature"] = generation_config.temperature
             generation_kwargs["top_p"] = generation_config.top_p
@@ -218,8 +222,25 @@ class VLMModel:
             token_count=int(generated_ids.shape[0]),
             ttft_seconds=ttft,
             elapsed_seconds=end - start,
-            meta={"backend": "transformers"},
+            meta={
+                "backend": "transformers",
+                "kivi_kv_cache": kivi_cache.report().__dict__ if kivi_cache is not None else None,
+            },
         )
+
+    def _build_kivi_cache_if_enabled(self):
+        enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            return None
+        from optiz_qwen.compression import KiviConfig, build_qwen35_kivi_cache
+
+        kivi_config = KiviConfig(
+            k_bits=int(os.environ.get("OPTIZ_QWEN_KIVI_K_BITS", "2")),
+            v_bits=int(os.environ.get("OPTIZ_QWEN_KIVI_V_BITS", "2")),
+            group_size=int(os.environ.get("OPTIZ_QWEN_KIVI_GROUP_SIZE", "32")),
+            residual_length=int(os.environ.get("OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH", "32")),
+        )
+        return build_qwen35_kivi_cache(self._model.config, kivi_config)
 
     def _generate_with_dummy(
         self,

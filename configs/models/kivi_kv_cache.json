@@ -1,0 +1,24 @@
+{
+  "name": "kivi_kv_cache_upstream",
+  "enabled_by_default": false,
+  "source_repo": "https://github.com/jy-yuan/KIVI",
+  "source_commit_checked": "876b4d2d08e3b1d5f70d0969c299d8c7c42ddfb6",
+  "local_source_path": "artifacts/third_party/KIVI",
+  "k_bits": 2,
+  "v_bits": 2,
+  "group_size": 32,
+  "residual_length": 32,
+  "supported_upstream_model_families": [
+    "llama",
+    "mistral"
+  ],
+  "qwen3_5_status": "local adapter uses upstream KIVI quant.new_pack for Qwen3.5 full_attention cache layers; native linear_attention cache is preserved",
+  "enable_env": "OPTIZ_QWEN_KIVI_KV_CACHE=1",
+  "target_conda_env": "optiz-qwen",
+  "triton_package": "triton-windows==3.7.1.post27",
+  "competition_notes": [
+    "Do not enable by default in the baseline path.",
+    "Do not claim optimized or PPU-adapted until compared through the repository benchmark path.",
+    "Accuracy-sensitive VLM tasks must track OCR and fine-grained localization risk."
+  ]
+}
