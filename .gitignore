@@ -3,7 +3,41 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .venv/
+venv/
+env/
 *.pyc
+*.pyo
+*.pyd
+.Python
+pip-wheel-metadata/
+build/
+dist/
+*.egg-info/
+
+# Operating systems
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+.fleet/
+.zed/
 
 # Local data and model artifacts
 resources/eval_dataset/raw/*
