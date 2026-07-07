@@ -199,17 +199,20 @@ def render_plot(
         "regressed": "#e45756",
         "both_wrong": "#f58518",
     }
-    fig = plt.figure(figsize=(12, max(6, 5.2 * len(datasets))), constrained_layout=True)
-    outer = fig.add_gridspec(len(datasets), 1, hspace=0.62)
+    fig, axes = plt.subplots(
+        4,
+        len(datasets),
+        figsize=(max(10, 6.5 * len(datasets)), 10),
+        squeeze=False,
+    )
 
-    for row_index, dataset in enumerate(datasets):
+    for col_index, dataset in enumerate(datasets):
         before = baseline[dataset]
         after = candidate[dataset]
-        subgrid = outer[row_index].subgridspec(4, 1, hspace=0.28)
-        status_ax = fig.add_subplot(subgrid[0])
-        ttft_ax = fig.add_subplot(subgrid[1])
-        throughput_ax = fig.add_subplot(subgrid[2])
-        token_ax = fig.add_subplot(subgrid[3])
+        status_ax = axes[0][col_index]
+        ttft_ax = axes[1][col_index]
+        throughput_ax = axes[2][col_index]
+        token_ax = axes[3][col_index]
 
         qids = [qid for qid in after.answer_order if qid in before.answers]
         qids.extend(qid for qid in before.answer_order if qid in after.answers and qid not in qids)
@@ -289,8 +292,15 @@ def render_plot(
         plt.Line2D([0], [0], marker="x", color="black", linestyle="", label=f"{baseline_name} validation error"),
         plt.Line2D([0], [0], marker="o", color="black", linestyle="", label=f"{candidate_name} validation error"),
     ]
-    fig.legend(handles=legend_handles, loc="upper center", ncol=6, fontsize=9)
-    fig.suptitle("Per-sample Benchmark Comparison", fontsize=14)
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.995),
+        ncol=6,
+        fontsize=9,
+    )
+    fig.suptitle("Per-sample Benchmark Comparison", fontsize=14, y=0.955)
+    fig.tight_layout(rect=(0, 0, 1, 0.91))
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=160)
     plt.close(fig)
