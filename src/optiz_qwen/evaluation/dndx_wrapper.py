@@ -80,6 +80,7 @@ class VLMModel:
                 generation_config=generation_config,
             )
         return self._generate_with_dummy(
+            image=image,
             prompt=prompt,
             choices=choices,
             generation_config=generation_config,
@@ -132,6 +133,9 @@ class VLMModel:
             return_dict=True,
             return_tensors="pt",
         ).to(self._model.device)
+        image_token_count = int((inputs.input_ids == self._processor.image_token_id).sum().item())
+        image_grid_thw = inputs["image_grid_thw"][0].tolist()
+        input_image_size = list(image.size)
         input_len = inputs.input_ids.shape[1]
         streamer = TextIteratorStreamer(
             self._processor.tokenizer,
@@ -184,12 +188,18 @@ class VLMModel:
             token_count=int(generated_ids.shape[0]),
             ttft_seconds=ttft,
             elapsed_seconds=end - start,
-            meta={"backend": "transformers"},
+            meta={
+                "backend": "transformers",
+                "input_image_size": input_image_size,
+                "image_grid_thw": image_grid_thw,
+                "image_token_count": image_token_count,
+            },
         )
 
     def _generate_with_dummy(
         self,
         *,
+        image,
         prompt: str,
         choices: dict[str, str],
         generation_config: GenerationConfig,
@@ -213,5 +223,6 @@ class VLMModel:
                 "backend": "dummy",
                 "reason": getattr(self, "_dummy_reason", "n/a"),
                 "prompt_chars": len(prompt),
+                "input_image_size": list(image.size),
             },
         )
