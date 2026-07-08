@@ -1,0 +1,10 @@
+name: qwen35_2b_baseline_bf16
+model_id: Qwen/Qwen3.5-2B
+base_model_path: resources/model_weights/raw/Qwen3.5-2B
+quantization: none
+activation_dtype: bf16
+performance_claim: not_benchmarked
+notes:
+  - Required BF16 control path for fair baseline-vs-AWQ comparison.
+  - This config does not change model loading behavior.
+  - Do not claim optimization gains from this baseline config.
