@@ -189,8 +189,12 @@ class VLMModel:
         output_holder: dict[str, Any] = {}
 
         def _run_generate() -> None:
-            with torch.no_grad():
-                output_holder["output_ids"] = self._model.generate(**generation_kwargs)
+            try:
+                with torch.no_grad():
+                    output_holder["output_ids"] = self._model.generate(**generation_kwargs)
+            except BaseException as exc:
+                output_holder["error"] = exc
+                streamer.end()
 
         worker = threading.Thread(target=_run_generate, daemon=True)
         start = time.perf_counter()
@@ -204,6 +208,8 @@ class VLMModel:
                 first_chunk_at = now
             chunks.append(chunk)
         worker.join()
+        if "error" in output_holder:
+            raise RuntimeError("Transformers generation failed inside the worker thread.") from output_holder["error"]
         end = time.perf_counter()
 
         output_ids = output_holder["output_ids"]

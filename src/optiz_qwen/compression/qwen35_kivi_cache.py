@@ -57,13 +57,26 @@ class KiviAttentionLayer(CacheLayerMixin):
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
 
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
+
+        if self._seq_length == 0:
+            self._rebuild_from_full(key_states, value_states)
+            return key_states, value_states
+
+        if key_states.shape[-2] == 1:
+            self._append_decode_token(key_states, value_states)
+            return self.materialize()
+
+        # Fallback for chunked updates: preserve correctness, but this path is
+        # more expensive because the native attention API needs dense tensors.
         if self._seq_length:
             previous_keys, previous_values = self.materialize()
             key_states = torch.cat([previous_keys, key_states], dim=-2)
             value_states = torch.cat([previous_values, value_states], dim=-2)
 
-        self._rebuild_from_full(key_states.contiguous(), value_states.contiguous())
-        return self.materialize()
+        self._rebuild_from_full(key_states, value_states)
+        return key_states, value_states
 
     def materialize(self) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.is_initialized or self._seq_length == 0:
@@ -131,6 +144,58 @@ class KiviAttentionLayer(CacheLayerMixin):
         self.keys = None
         self.values = None
 
+    def _append_decode_token(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.dtype = key_states.dtype
+        self.device = key_states.device
+        self.is_initialized = True
+        self._seq_length += int(key_states.shape[-2])
+        self._append_keys(key_states)
+        self._append_values(value_states)
+        self.keys = None
+        self.values = None
+
+    def _append_keys(self, key_states: torch.Tensor) -> None:
+        if self._key_residual is None:
+            self._key_residual = key_states
+        else:
+            self._key_residual = torch.cat([self._key_residual, key_states], dim=-2).contiguous()
+
+        if self._key_residual.shape[-2] < self.config.residual_length:
+            return
+
+        self._validate_pack_dim(self._key_residual.shape[-2], self.config.k_bits, "key residual token dimension")
+        key_code, key_scale, key_mn = self.quant_module.triton_quantize_and_pack_along_last_dim(
+            self._key_residual.transpose(2, 3).contiguous(),
+            self.config.group_size,
+            self.config.k_bits,
+        )
+        self._key_code = self._concat_or_init(self._key_code, key_code, dim=-1)
+        self._key_scale = self._concat_or_init(self._key_scale, key_scale, dim=-1)
+        self._key_mn = self._concat_or_init(self._key_mn, key_mn, dim=-1)
+        self._key_residual = self._key_residual[..., 0:0, :].contiguous()
+
+    def _append_values(self, value_states: torch.Tensor) -> None:
+        if self._value_residual is None:
+            self._value_residual = value_states
+        else:
+            self._value_residual = torch.cat([self._value_residual, value_states], dim=-2).contiguous()
+
+        overflow = self._value_residual.shape[-2] - self.config.residual_length
+        if overflow <= 0:
+            return
+
+        value_quant = self._value_residual[..., :overflow, :].contiguous()
+        self._value_residual = self._value_residual[..., overflow:, :].contiguous()
+        self._validate_pack_dim(int(value_quant.shape[-1]), self.config.v_bits, "value head dimension")
+        value_code, value_scale, value_mn = self.quant_module.triton_quantize_and_pack_along_last_dim(
+            value_quant,
+            self.config.group_size,
+            self.config.v_bits,
+        )
+        self._value_code = self._concat_or_init(self._value_code, value_code, dim=-2)
+        self._value_scale = self._concat_or_init(self._value_scale, value_scale, dim=-2)
+        self._value_mn = self._concat_or_init(self._value_mn, value_mn, dim=-2)
+
     def _pack_keys(self, keys: torch.Tensor) -> None:
         seq_len = int(keys.shape[-2])
         quant_len = seq_len - (seq_len % self.config.residual_length)
@@ -174,7 +239,7 @@ class KiviAttentionLayer(CacheLayerMixin):
                 self._key_mn.unsqueeze(-1),
                 self.config.group_size,
                 self.config.k_bits,
-            ).transpose(2, 3)
+            ).transpose(2, 3).to(dtype=self.dtype)
             parts.append(dequantized)
         if self._key_residual is not None and self._key_residual.shape[-2] > 0:
             parts.append(self._key_residual)
@@ -190,7 +255,7 @@ class KiviAttentionLayer(CacheLayerMixin):
                     self._value_mn.unsqueeze(-1),
                     self.config.group_size,
                     self.config.v_bits,
-                )
+                ).to(dtype=self.dtype)
             )
         if self._value_residual is not None and self._value_residual.shape[-2] > 0:
             parts.append(self._value_residual)
@@ -203,6 +268,12 @@ class KiviAttentionLayer(CacheLayerMixin):
             raise ValueError(
                 f"KIVI {name}={size} must be divisible by {features_per_int} for {bits}-bit packing."
             )
+
+    @staticmethod
+    def _concat_or_init(existing: torch.Tensor | None, new: torch.Tensor, dim: int) -> torch.Tensor:
+        if existing is None:
+            return new
+        return torch.cat([existing, new], dim=dim).contiguous()
 
 
 class Qwen35KiviCache(DynamicCache):
