@@ -253,14 +253,34 @@ def render_plot(
 
         status_ax.bar(x, [1] * len(x), color=[status_colors[s] for s in statuses], width=0.9)
         if invalid_before_x:
-            status_ax.scatter(invalid_before_x, [0.25] * len(invalid_before_x), color="black", marker="x", s=28, label=f"{baseline_name} invalid")
+            status_ax.scatter(
+                invalid_before_x,
+                [0.25] * len(invalid_before_x),
+                color="black",
+                marker="x",
+                s=36,
+                linewidths=1.4,
+                zorder=4,
+                label=f"{baseline_name} invalid",
+            )
         if invalid_after_x:
-            status_ax.scatter(invalid_after_x, [0.75] * len(invalid_after_x), color="black", marker="o", s=18, label=f"{candidate_name} invalid")
+            status_ax.scatter(
+                invalid_after_x,
+                [0.75] * len(invalid_after_x),
+                facecolors="black",
+                edgecolors="white",
+                marker="o",
+                s=28,
+                linewidths=0.7,
+                zorder=4,
+                label=f"{candidate_name} invalid",
+            )
         status_ax.set_title(
             f"{dataset}: answer status "
             f"({baseline_name} acc {before.accuracy:.3f}, {candidate_name} acc {after.accuracy:.3f})"
         )
         status_ax.set_yticks([])
+        status_ax.set_ylim(0, 1)
 
         ttft_colors = ["#54a24b" if value < 0 else "#e45756" if value > 0 else "#9d9d9d" for value in ttft_delta]
         ttft_ax.bar(x, ttft_delta, color=ttft_colors, width=0.85)
