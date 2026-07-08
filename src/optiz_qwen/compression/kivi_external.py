@@ -84,6 +84,20 @@ class KiviSourceStatus:
         return self.exists and not self.missing_files
 
 
+@dataclass(frozen=True)
+class KiviQbMatmulStatus:
+    """Availability report for upstream KIVI qB MatMul kernels."""
+
+    path: Path
+    source_tree_ready: bool
+    importable: bool
+    has_triton_outer_kernel: bool
+    has_cuda_outer_kernel: bool
+    requires_cuda_extension: bool
+    import_error: str | None
+    integration_status: str
+
+
 def project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
@@ -114,6 +128,51 @@ def inspect_kivi_source(source_path: str | Path | None = None) -> KiviSourceStat
         commit=commit,
         license_name=license_name,
         supported_model_families=tuple(sorted(SUPPORTED_UPSTREAM_MODEL_FAMILIES)),
+    )
+
+
+def inspect_qb_matmul_kernel(source_path: str | Path | None = None) -> KiviQbMatmulStatus:
+    """Inspect whether upstream KIVI qB MatMul kernels can be imported.
+
+    This is a capability probe only.  A positive import check is not enough
+    to claim the Qwen3.5 VLM adapter has replaced native attention.
+    """
+
+    status = inspect_kivi_source(source_path)
+    import_error = None
+    module = None
+    if status.usable_source_tree:
+        previous_modules = {
+            name: sys.modules.get(name)
+            for name in ("quant", "quant.matmul", "kivi_gemv")
+        }
+        for name in previous_modules:
+            sys.modules.pop(name, None)
+        with _temporary_sys_path(status.path):
+            try:
+                module = importlib.import_module("quant.matmul")
+            except Exception as exc:  # pragma: no cover - depends on optional CUDA deps
+                import_error = repr(exc)
+        for name, previous in previous_modules.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+    else:
+        import_error = f"source tree is not ready; missing={list(status.missing_files)}"
+
+    has_triton = bool(module is not None and hasattr(module, "triton_bmm_fA_qB_outer"))
+    has_cuda = bool(module is not None and hasattr(module, "cuda_bmm_fA_qB_outer"))
+    requires_cuda_extension = bool(import_error and "kivi_gemv" in import_error)
+    return KiviQbMatmulStatus(
+        path=status.path,
+        source_tree_ready=status.usable_source_tree,
+        importable=module is not None,
+        has_triton_outer_kernel=has_triton,
+        has_cuda_outer_kernel=has_cuda,
+        requires_cuda_extension=requires_cuda_extension,
+        import_error=import_error,
+        integration_status="not_integrated_for_qwen3_5_vlm_attention",
     )
 
 

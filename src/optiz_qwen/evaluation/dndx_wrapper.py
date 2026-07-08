@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from optiz_qwen.evaluation.answer_parsing import parse_choice_answer
+
 
 @dataclass
 class GenerationConfig:
@@ -80,6 +82,7 @@ class VLMModel:
             return self._generate_with_transformers(
                 image=image,
                 prompt=prompt,
+                choices=choices,
                 generation_config=generation_config,
             )
         return self._generate_with_dummy(
@@ -147,6 +150,7 @@ class VLMModel:
         *,
         image,
         prompt: str,
+        choices: dict[str, str],
         generation_config: GenerationConfig,
     ) -> GenerationResult:
         import torch
@@ -222,6 +226,25 @@ class VLMModel:
                 clean_up_tokenization_spaces=False,
             ).strip()
 
+        raw_text = text
+        parsed_answer, answer_source = parse_choice_answer(text, choices)
+        choice_fallback_meta = None
+        if parsed_answer is None and self._choice_fallback_enabled():
+            fallback_start = time.perf_counter()
+            parsed_answer, choice_fallback_meta = self._select_choice_by_logits(
+                image=image,
+                prompt=prompt,
+                choices=choices,
+            )
+            if parsed_answer is not None:
+                answer_source = "logit_choice_fallback"
+                text = f"Answer: {parsed_answer}"
+                if raw_text:
+                    text = f"{text}\nRaw response: {raw_text}"
+            end = time.perf_counter()
+            if first_chunk_at is None and parsed_answer is not None:
+                first_chunk_at = fallback_start
+
         ttft = (first_chunk_at - start) if first_chunk_at is not None else (end - start)
         return GenerationResult(
             text=text,
@@ -231,6 +254,9 @@ class VLMModel:
             meta={
                 "backend": "transformers",
                 "kivi_kv_cache": kivi_cache.report().__dict__ if kivi_cache is not None else None,
+                "answer_source": answer_source,
+                "raw_text": raw_text,
+                "choice_fallback": choice_fallback_meta,
             },
         )
 
@@ -247,6 +273,61 @@ class VLMModel:
             residual_length=int(os.environ.get("OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH", "32")),
         )
         return build_qwen35_kivi_cache(self._model.config, kivi_config)
+
+    def _choice_fallback_enabled(self) -> bool:
+        value = os.environ.get("OPTIZ_QWEN_CHOICE_FALLBACK", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _select_choice_by_logits(
+        self,
+        *,
+        image,
+        prompt: str,
+        choices: dict[str, str],
+    ) -> tuple[str | None, dict[str, Any]]:
+        usable_choices = [
+            key
+            for key, value in choices.items()
+            if key in {"A", "B", "C", "D"} and (value or "").strip()
+        ]
+        if not usable_choices:
+            usable_choices = ["A", "B", "C", "D"]
+
+        try:
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": f"{prompt.rstrip()}\nAnswer:"},
+                ],
+            }]
+            inputs = self._processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(self._model.device)
+            with self._torch.no_grad():
+                outputs = self._model(**inputs, use_cache=False)
+            logits = outputs.logits[0, -1, :]
+            scores = {}
+            for key in usable_choices:
+                token_ids = self._candidate_token_ids(key)
+                scores[key] = max(float(logits[token_id]) for token_id in token_ids)
+            picked = max(scores, key=scores.get)
+            return picked, {"enabled": True, "scores": scores}
+        except Exception as exc:
+            return None, {"enabled": True, "error": repr(exc)}
+
+    def _candidate_token_ids(self, choice: str) -> tuple[int, ...]:
+        tokenizer = self._tokenizer or self._processor.tokenizer
+        token_ids: list[int] = []
+        for variant in (choice, f" {choice}", f"{choice}.", f"({choice})"):
+            encoded = tokenizer.encode(variant, add_special_tokens=False)
+            if encoded:
+                token_ids.append(int(encoded[0]))
+        return tuple(dict.fromkeys(token_ids))
 
     def _generate_with_dummy(
         self,

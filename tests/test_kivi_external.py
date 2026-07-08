@@ -11,6 +11,7 @@ from optiz_qwen.compression.kivi_external import (
     apply_kivi_config_to_transformers_config,
     infer_upstream_model_family,
     inspect_kivi_source,
+    inspect_qb_matmul_kernel,
     load_upstream_quant_module,
 )
 
@@ -51,6 +52,40 @@ def test_quant_module_loader_uses_upstream_source_path(tmp_path: Path) -> None:
     module = load_upstream_quant_module(tmp_path)
 
     assert module.SOURCE == "upstream-kivi-test"
+
+
+def test_qb_matmul_probe_reports_missing_cuda_extension(tmp_path: Path) -> None:
+    write_minimal_kivi_layout(tmp_path)
+    (tmp_path / "quant" / "matmul.py").write_text(
+        "import kivi_gemv\n"
+        "def triton_bmm_fA_qB_outer(): pass\n"
+        "def cuda_bmm_fA_qB_outer(): pass\n",
+        encoding="utf-8",
+    )
+
+    status = inspect_qb_matmul_kernel(tmp_path)
+
+    assert status.source_tree_ready is True
+    assert status.importable is False
+    assert status.requires_cuda_extension is True
+    assert "kivi_gemv" in (status.import_error or "")
+    assert status.integration_status == "not_integrated_for_qwen3_5_vlm_attention"
+
+
+def test_qb_matmul_probe_detects_importable_kernel_symbols(tmp_path: Path) -> None:
+    write_minimal_kivi_layout(tmp_path)
+    (tmp_path / "quant" / "matmul.py").write_text(
+        "def triton_bmm_fA_qB_outer(): pass\n"
+        "def cuda_bmm_fA_qB_outer(): pass\n",
+        encoding="utf-8",
+    )
+
+    status = inspect_qb_matmul_kernel(tmp_path)
+
+    assert status.importable is True
+    assert status.has_triton_outer_kernel is True
+    assert status.has_cuda_outer_kernel is True
+    assert status.integration_status == "not_integrated_for_qwen3_5_vlm_attention"
 
 
 def test_kivi_config_is_attached_to_transformers_config() -> None:
