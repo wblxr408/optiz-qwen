@@ -125,6 +125,60 @@ Use a separate `resources/local_validation/` spec. Reusing official or public
 MMBench data is weaker for this phase because local smoke checks are not score
 artifacts and must not be reported as official benchmark results.
 
+## Phase 4 Local Smoke Runner Dry-Run
+
+Phase 4 adds `scripts/validate_local_awq.py`, a dry-run CLI for the local smoke
+validation plan.
+
+Example:
+
+```bash
+D:\Miniconda\envs\optiz-qwen\python.exe scripts/validate_local_awq.py ^
+  --config configs/experiments/local_awq_smoke.yaml ^
+  --dry-run
+```
+
+The runner:
+
+- reads `configs/experiments/local_awq_smoke.yaml`
+- requires `validation_scope: local_smoke`
+- requires `performance_claim: not_benchmarked`
+- validates repository-relative config and sample paths
+- reports `samples_status: missing` when `samples.jsonl` has not been created
+- validates only JSONL metadata fields when a local sample file exists
+- prints a JSON plan to stdout
+
+It does not:
+
+- load model weights
+- read or decode images
+- run local inference
+- quantize weights
+- write benchmark outputs or artifacts
+- use the official competition evaluation dataset
+- touch `benchmark_public.py`
+- claim accuracy, TTFT, throughput, memory, or bandwidth gains
+
+## Phase 4 Decision Note
+
+Candidate options:
+
+- Add a dry-run local smoke runner now.
+- Wait until real AWQ inference can run and add validation then.
+
+Evaluation dimensions:
+
+- Keeps local sample contracts testable before model execution exists.
+- Preserves the separation between smoke checks and official benchmark code.
+- Avoids accidental model loading or artifact writes on small local GPUs.
+- Maintains `performance_claim: not_benchmarked`.
+
+Final choice:
+
+Add the dry-run runner now. Waiting for real inference is weaker for this phase
+because the sample and config contract can be validated safely before hardware,
+artifacts, and final local samples are available.
+
 ## Output Directory Rule
 
 The output directory must be repository-relative and must be either:
