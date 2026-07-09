@@ -28,6 +28,60 @@ D:\Miniconda\envs\optiz-qwen\python.exe scripts/quantize_awq.py ^
 The output is a JSON plan with `performance_claim: not_benchmarked` and
 `writes_artifacts: false`.
 
+## Phase 2 Calibration Data Adapter
+
+Phase 2 adds a lightweight MMBench TSV adapter in
+`src/optiz_qwen/compression/awq_calibration.py`.
+
+It reads rows from a repository-relative TSV path or a `Path` object and returns
+prompt-plan records with:
+
+- `sample_id`
+- `question`
+- non-empty `A/B/C/D` options
+- optional `hint`
+- optional `answer`
+- `image_present`
+- `prompt_text`
+
+The adapter supports `max_samples` for small calibration subsets.
+
+It does not:
+
+- decode image base64
+- write image files
+- load model weights
+- import or call `torch`, `transformers`, or AutoAWQ
+- write files under `artifacts/`
+- claim accuracy, TTFT, throughput, memory, or bandwidth gains
+
+Example validation command:
+
+```bash
+D:\Miniconda\envs\optiz-qwen\python.exe -m pytest tests/test_awq_calibration.py -q
+```
+
+## Phase 2 Decision Note
+
+Candidate options:
+
+- Reuse the public benchmark MMBench loader.
+- Add a compression-layer calibration adapter.
+
+Evaluation dimensions:
+
+- Keeps AWQ preparation inside the model-compression layer.
+- Avoids decoding images or loading models during calibration planning.
+- Leaves public benchmark entrypoints unchanged for fair baseline comparison.
+- Keeps the path switchable before real AWQ execution.
+
+Final choice:
+
+Use a separate compression-layer adapter. Reusing the benchmark loader is weaker
+for this phase because that path is tied to evaluation execution, image decoding,
+and generation metrics, while AWQ calibration planning needs only lightweight
+records and prompt text.
+
 ## Output Directory Rule
 
 The output directory must be repository-relative and must be either:
