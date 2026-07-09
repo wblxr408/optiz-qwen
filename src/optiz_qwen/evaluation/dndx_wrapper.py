@@ -87,6 +87,7 @@ class VLMModel:
                 generation_config=generation_config,
             )
         return self._generate_with_dummy(
+            image=image,
             prompt=prompt,
             choices=choices,
             generation_config=generation_config,
@@ -194,9 +195,21 @@ class VLMModel:
         import torch
         from transformers import TextIteratorStreamer
 
-        inputs = self._build_model_inputs(image=image, prompt=prompt)
-        model_device = getattr(self._model, "device", self._resolved_device)
-        input_len = int(inputs["input_ids"].shape[1])
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt},
+            ],
+        }]
+        inputs = self._processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(self._model.device)
+        input_len = inputs.input_ids.shape[1]
         streamer = TextIteratorStreamer(
             self._tokenizer,
             skip_prompt=True,
@@ -279,8 +292,6 @@ class VLMModel:
             elapsed_seconds=end - start,
             meta={
                 "backend": "transformers",
-                "device": str(model_device),
-                "model_path": self.model_path,
                 "kivi_kv_cache": kivi_cache.report().__dict__ if kivi_cache is not None else None,
                 "answer_source": answer_source,
                 "raw_text": raw_text,
@@ -347,6 +358,7 @@ class VLMModel:
     def _generate_with_dummy(
         self,
         *,
+        image,
         prompt: str,
         choices: dict[str, str],
         generation_config: GenerationConfig,
@@ -370,5 +382,6 @@ class VLMModel:
                 "backend": "dummy",
                 "reason": getattr(self, "_dummy_reason", "n/a"),
                 "prompt_chars": len(prompt),
+                "input_image_size": list(image.size),
             },
         )
