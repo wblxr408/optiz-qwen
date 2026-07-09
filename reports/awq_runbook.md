@@ -82,6 +82,49 @@ for this phase because that path is tied to evaluation execution, image decoding
 and generation metrics, while AWQ calibration planning needs only lightweight
 records and prompt text.
 
+## Phase 3 Local Smoke Validation Spec
+
+Phase 3 defines a local-only smoke validation contract:
+
+- config: `configs/experiments/local_awq_smoke.yaml`
+- sample landing path: `resources/local_validation/samples.jsonl`
+- sample format note: `resources/local_validation/README.md`
+
+This is not an official benchmark. It is only for quick smoke, regression, and
+sanity checks before any formal baseline-vs-AWQ comparison.
+
+The config keeps:
+
+- `validation_scope: local_smoke`
+- `quantization: awq_w4a16`
+- `performance_claim: not_benchmarked`
+- `max_samples: 10`
+- `max_new_tokens: 64`
+
+The phase does not create `samples.jsonl`, image files, benchmark outputs, or
+quantized artifacts. It also does not load models, run inference, quantize
+weights, or use the official competition evaluation dataset.
+
+## Phase 3 Decision Note
+
+Candidate options:
+
+- Use official or public MMBench data for the smoke set.
+- Define a separate team-authored local validation area.
+
+Evaluation dimensions:
+
+- Avoids contaminating official evaluation data.
+- Keeps local smoke checks separate from `benchmark_public.py`.
+- Allows tiny hand-authored OCR, localization, and instruction-following cases.
+- Preserves `performance_claim: not_benchmarked` until real benchmark artifacts exist.
+
+Final choice:
+
+Use a separate `resources/local_validation/` spec. Reusing official or public
+MMBench data is weaker for this phase because local smoke checks are not score
+artifacts and must not be reported as official benchmark results.
+
 ## Output Directory Rule
 
 The output directory must be repository-relative and must be either:

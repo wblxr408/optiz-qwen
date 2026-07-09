@@ -1,0 +1,17 @@
+validation_scope: local_smoke
+description: "Local AWQ smoke validation only; not an official benchmark."
+baseline_model_path: resources/model_weights/raw/Qwen3.5-2B
+awq_artifact_path: artifacts/quantized/qwen35_2b_awq_w4a16
+local_validation_data: resources/local_validation/samples.jsonl
+quantization: awq_w4a16
+performance_claim: not_benchmarked
+max_samples: 10
+max_new_tokens: 64
+safeguards:
+  - "Use only local team-authored samples under resources/local_validation/."
+  - "Do not use the official competition evaluation dataset or public MMBench TSV content."
+  - "Do not write quantized artifacts, benchmark outputs, decoded images, or generated reports."
+  - "Treat local smoke results as regression and sanity-check signals only."
+notes:
+  - "resources/local_validation/samples.jsonl is intentionally not created in this phase."
+  - "Run official comparisons only through the benchmark path after a real baseline-vs-AWQ artifact exists."
