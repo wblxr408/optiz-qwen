@@ -9,10 +9,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from optiz_qwen.compression.awq_backend import probe_awq_backend
+
 DEFAULT_MODEL_PATH = "resources/model_weights/raw/Qwen3.5-2B"
 DEFAULT_CALIBRATION_TSV = "resources/eval_dataset/raw/mmbench_public/mmbench_dev_en.tsv"
 DEFAULT_OUTPUT_DIR = "artifacts/quantized/qwen35_2b_awq_w4a16"
@@ -66,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--activation-dtype", default="bf16")
     parser.add_argument("--zero-point", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--backend", default="autoawq")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -86,6 +94,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         field_name="calibration_tsv",
     )
     output_dir = validate_output_dir(args.output_dir)
+    backend_readiness = probe_awq_backend(args.backend)
 
     return {
         "phase": "awq_w4a16_dry_run",
@@ -108,6 +117,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "source_format": "MMBench TSV",
             "sample_count": args.num_calibration_samples,
         },
+        "backend": backend_readiness.to_dict(),
         "metadata_preview": {
             "artifact_status": "not_generated",
             "performance_claim": "not_benchmarked",
@@ -121,7 +131,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.dry_run:
-        parser.error("current phase only supports --dry-run; real AWQ is not implemented")
+        parser.error(
+            "current phase only supports --dry-run; real AWQ execution is not "
+            "implemented in this phase"
+        )
 
     try:
         plan = build_plan(args)

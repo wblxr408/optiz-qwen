@@ -179,6 +179,69 @@ Add the dry-run runner now. Waiting for real inference is weaker for this phase
 because the sample and config contract can be validated safely before hardware,
 artifacts, and final local samples are available.
 
+## Phase 5 AWQ Backend Readiness Probe
+
+Phase 5 adds `src/optiz_qwen/compression/awq_backend.py` and extends
+`scripts/quantize_awq.py` with `--backend autoawq`.
+
+The backend probe uses `importlib.util.find_spec` only. It records whether the
+planned AutoAWQ import target appears to be discoverable, but it does not import
+`torch`, `transformers`, `awq`, `autoawq`, or AutoAWQ runtime code.
+
+Example:
+
+```bash
+D:\Miniconda\envs\optiz-qwen\python.exe scripts/quantize_awq.py ^
+  --model-path resources/model_weights/raw/Qwen3.5-2B ^
+  --calibration-tsv resources/eval_dataset/raw/mmbench_public/mmbench_dev_en.tsv ^
+  --output-dir artifacts/quantized/qwen35_2b_awq_w4a16 ^
+  --backend autoawq ^
+  --dry-run
+```
+
+The dry-run JSON includes backend readiness fields:
+
+- `backend_name`
+- `package_available`
+- `can_quantize`
+- `reason`
+- `recommended_environment`
+
+`can_quantize` remains `false` in this phase even if an import target is found.
+Dependency discovery is not proof that the current machine can produce a valid
+Qwen3.5-2B VLM AWQ artifact.
+
+It does not:
+
+- install dependencies
+- load model weights
+- import or call `torch`, `transformers`, AutoAWQ, `awq`, or `autoawq`
+- execute real AWQ quantization
+- write files under `artifacts/`
+- use the official competition evaluation dataset
+- touch `benchmark_public.py`
+- claim accuracy, TTFT, throughput, memory, or bandwidth gains
+
+## Phase 5 Decision Note
+
+Candidate options:
+
+- Add a lightweight backend readiness probe with `find_spec`.
+- Import AutoAWQ and fail fast if the runtime is unavailable.
+
+Evaluation dimensions:
+
+- Keeps the current local Windows GPU environment safe from accidental model execution.
+- Avoids adding or installing dependencies before the real quantization host is chosen.
+- Makes the future backend choice visible in the dry-run plan.
+- Preserves `performance_claim: not_benchmarked`.
+
+Final choice:
+
+Use the lightweight probe. Importing AutoAWQ now is weaker for this competition
+flow because it may trigger heavyweight dependency paths before the baseline,
+calibration, and target quantization environment are ready.
+
 ## Output Directory Rule
 
 The output directory must be repository-relative and must be either:

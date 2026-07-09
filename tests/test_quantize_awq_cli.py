@@ -72,8 +72,33 @@ def test_dry_run_outputs_plan_without_creating_artifact(
     assert payload["quantization"]["scheme"] == "W4A16"
     assert payload["quantization"]["weight_bits"] == 4
     assert payload["quantization"]["activation_dtype"] == "bf16"
+    assert payload["backend"]["backend_name"] == "autoawq"
+    assert isinstance(payload["backend"]["package_available"], bool)
+    assert payload["backend"]["can_quantize"] is False
+    assert payload["backend"]["reason"]
+    assert payload["backend"]["recommended_environment"]
     assert payload["metadata_preview"]["performance_claim"] == "not_benchmarked"
     assert payload["metadata_preview"]["writes_artifacts"] is False
+    assert payload["metadata_preview"]["loads_model"] is False
+
+
+def test_dry_run_accepts_explicit_autoawq_backend(cli_inputs: dict[str, str]) -> None:
+    result = run_cli(
+        "--model-path",
+        cli_inputs["model_path"],
+        "--calibration-tsv",
+        cli_inputs["calibration_tsv"],
+        "--output-dir",
+        OUTPUT_DIR,
+        "--backend",
+        "autoawq",
+        "--dry-run",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["backend"]["backend_name"] == "autoawq"
+    assert payload["backend"]["can_quantize"] is False
 
 
 def test_non_dry_run_is_rejected(cli_inputs: dict[str, str]) -> None:
@@ -88,7 +113,24 @@ def test_non_dry_run_is_rejected(cli_inputs: dict[str, str]) -> None:
 
     assert result.returncode != 0
     assert "only supports --dry-run" in result.stderr
-    assert "real AWQ is not implemented" in result.stderr
+    assert "real AWQ execution is not implemented in this phase" in result.stderr
+
+
+def test_unknown_backend_is_rejected(cli_inputs: dict[str, str]) -> None:
+    result = run_cli(
+        "--model-path",
+        cli_inputs["model_path"],
+        "--calibration-tsv",
+        cli_inputs["calibration_tsv"],
+        "--output-dir",
+        OUTPUT_DIR,
+        "--backend",
+        "unknown_backend",
+        "--dry-run",
+    )
+
+    assert result.returncode != 0
+    assert "unsupported AWQ backend" in result.stderr
 
 
 def test_output_dir_must_stay_under_awq_artifact_root(
