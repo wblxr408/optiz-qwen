@@ -64,6 +64,15 @@ pip install -r configs/requirements/dndx_public.txt
 python benchmark_public.py --backend dummy --num-samples 4
 ```
 
+KIVI KV-cache experiment example:
+
+```bash
+python benchmark_public.py --backend transformers --device cuda --enable-kivi-kv-cache
+```
+
+The baseline remains KIVI-off by default.  KIVI can also be enabled with
+`OPTIZ_QWEN_KIVI_KV_CACHE=1` for compatibility with earlier scripts.
+
 ## Missing external assets
 
 See `resources/MANIFEST.md`.

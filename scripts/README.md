@@ -24,6 +24,10 @@ conda create -n optiz-qwen python=3.11 -y
 conda run -n optiz-qwen python -m pip install -r configs/requirements/dndx_public.txt
 ```
 
+On Windows PowerShell, prefer `conda run --no-capture-output -n optiz-qwen ...`
+for benchmark commands so tqdm progress bars are streamed directly instead of
+being re-encoded by `conda run`.
+
 For local Mac development, install extra helper packages separately. These are
 not part of the organizer's minimal dependency list:
 

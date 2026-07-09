@@ -8,25 +8,29 @@ import csv
 import io
 import json
 import math
+import os
 import random
-import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
 
+from .answer_parsing import extract_answer, parse_choice_answer
 from .dndx_wrapper import GenerationConfig, VLMModel
-
-ANSWER_RE = re.compile(
-    r"(?:answer|答案)\s*[:：]?\s*([ABCD])|^\s*([ABCD])(?:[\s\.\):：]|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
 
 DEFAULT_DATASET_PATH = "./resources/eval_dataset/raw/mmbench_public/mmbench_dev_en.tsv"
 DEFAULT_MODEL_PATH = "./resources/model_weights/raw/Qwen3.5-2B"
 DEFAULT_OUTPUT_PATH = "./benchmarks/output/result_public.json"
+KIVI_ENV_KEYS = (
+    "OPTIZ_QWEN_KIVI_KV_CACHE",
+    "OPTIZ_QWEN_KIVI_K_BITS",
+    "OPTIZ_QWEN_KIVI_V_BITS",
+    "OPTIZ_QWEN_KIVI_GROUP_SIZE",
+    "OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH",
+)
 
 
 @dataclass
@@ -61,6 +65,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--warmup-samples", type=int, default=2)
+    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--enable-kivi-kv-cache",
+        action="store_true",
+        help="Enable the local Qwen3.5 KIVI KV-cache adapter for this run.",
+    )
+    parser.add_argument("--kivi-k-bits", type=int, default=2)
+    parser.add_argument("--kivi-v-bits", type=int, default=2)
+    parser.add_argument("--kivi-group-size", type=int, default=32)
+    parser.add_argument("--kivi-residual-length", type=int, default=32)
     return parser.parse_args()
 
 
@@ -119,20 +133,8 @@ def build_prompt(sample: Sample) -> str:
     )
 
 
-def fixed_generation_config() -> GenerationConfig:
-    return GenerationConfig(max_new_tokens=64, temperature=0.0, top_p=1.0)
-
-
-def extract_answer(text: str) -> str | None:
-    if not text:
-        return None
-    match = ANSWER_RE.search(text)
-    if not match:
-        return None
-    for group in match.groups():
-        if group:
-            return group.upper()
-    return None
+def fixed_generation_config(max_new_tokens: int = 64) -> GenerationConfig:
+    return GenerationConfig(max_new_tokens=max_new_tokens, temperature=0.0, top_p=1.0)
 
 
 def compute_throughput(
@@ -182,6 +184,25 @@ def validate_public_result(
     return errors
 
 
+@contextmanager
+def kivi_cli_environment(args: argparse.Namespace):
+    previous = {key: os.environ.get(key) for key in KIVI_ENV_KEYS}
+    if args.enable_kivi_kv_cache:
+        os.environ["OPTIZ_QWEN_KIVI_KV_CACHE"] = "1"
+        os.environ["OPTIZ_QWEN_KIVI_K_BITS"] = str(args.kivi_k_bits)
+        os.environ["OPTIZ_QWEN_KIVI_V_BITS"] = str(args.kivi_v_bits)
+        os.environ["OPTIZ_QWEN_KIVI_GROUP_SIZE"] = str(args.kivi_group_size)
+        os.environ["OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH"] = str(args.kivi_residual_length)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def run_benchmark(args: argparse.Namespace) -> dict:
     benchmark_start = time.perf_counter()
     random.seed(args.seed)
@@ -202,70 +223,80 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     if not samples:
         raise ValueError(f"No samples loaded from {dataset_path}")
 
-    model = VLMModel(args.model_path, backend=args.backend, device=args.device)
+    kivi_env_enabled = False
+    with kivi_cli_environment(args):
+        kivi_env_enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        model = VLMModel(args.model_path, backend=args.backend, device=args.device)
 
-    for sample in samples[: min(args.warmup_samples, len(samples))]:
-        settle_runtime(model)
-        model.generate_with_metrics(
-            image=decode_image(sample.image_b64),
-            prompt=build_prompt(sample),
-            choices=sample.choices,
-            generation_config=fixed_generation_config(),
-            sample_id=sample.sample_id,
-        )
-        settle_runtime(model)
+        for sample in samples[: min(args.warmup_samples, len(samples))]:
+            settle_runtime(model)
+            model.generate_with_metrics(
+                image=decode_image(sample.image_b64),
+                prompt=build_prompt(sample),
+                choices=sample.choices,
+                generation_config=fixed_generation_config(args.max_new_tokens),
+                sample_id=sample.sample_id,
+            )
+            settle_runtime(model)
 
-    records = []
-    ttfts_ms = []
-    throughputs = []
-    correct = 0
-    validation_errors = 0
+        records = []
+        ttfts_ms = []
+        throughputs = []
+        correct = 0
+        validation_errors = 0
 
-    for sample in samples:
-        settle_runtime(model)
-        config = fixed_generation_config()
-        result = model.generate_with_metrics(
-            image=decode_image(sample.image_b64),
-            prompt=build_prompt(sample),
-            choices=sample.choices,
-            generation_config=config,
-            sample_id=sample.sample_id,
-        )
-        parsed_answer = extract_answer(result.text)
-        errors = validate_public_result(
-            result.text,
-            parsed_answer,
-            result.token_count,
-            config.max_new_tokens,
-        )
-        validation_errors += int(bool(errors))
-        is_correct = parsed_answer == sample.answer
-        correct += int(is_correct)
+        for sample in samples:
+            settle_runtime(model)
+            config = fixed_generation_config(args.max_new_tokens)
+            result = model.generate_with_metrics(
+                image=decode_image(sample.image_b64),
+                prompt=build_prompt(sample),
+                choices=sample.choices,
+                generation_config=config,
+                sample_id=sample.sample_id,
+            )
+            parsed_answer, answer_source = parse_choice_answer(result.text, sample.choices)
+            errors = validate_public_result(
+                result.text,
+                parsed_answer,
+                result.token_count,
+                config.max_new_tokens,
+            )
+            validation_errors += int(bool(errors))
+            is_correct = parsed_answer == sample.answer
+            correct += int(is_correct)
 
-        ttft_ms = result.ttft_seconds * 1000.0
-        throughput = compute_throughput(
-            result.token_count,
-            result.ttft_seconds,
-            result.elapsed_seconds,
-        )
-        if math.isfinite(ttft_ms) and ttft_ms > 0:
-            ttfts_ms.append(ttft_ms)
-        if math.isfinite(throughput) and throughput > 0:
-            throughputs.append(throughput)
+            ttft_ms = result.ttft_seconds * 1000.0
+            throughput = compute_throughput(
+                result.token_count,
+                result.ttft_seconds,
+                result.elapsed_seconds,
+            )
+            if math.isfinite(ttft_ms) and ttft_ms > 0:
+                ttfts_ms.append(ttft_ms)
+            if math.isfinite(throughput) and throughput > 0:
+                throughputs.append(throughput)
 
-        records.append(
-            {
-                "question_id": sample.sample_id,
-                "parsed_answer": parsed_answer,
-                "correct": is_correct,
-                "ttft_ms": round(ttft_ms, 3),
-                "throughput_tokens_per_sec": round(throughput, 3),
-                "token_count": result.token_count,
-                "validation_errors": errors,
-                "meta": result.meta,
-            }
-        )
-        settle_runtime(model)
+            records.append(
+                {
+                    "question_id": sample.sample_id,
+                    "text": result.text,
+                    "parsed_answer": parsed_answer,
+                    "answer_source": answer_source,
+                    "correct": is_correct,
+                    "ttft_ms": round(ttft_ms, 3),
+                    "throughput_tokens_per_sec": round(throughput, 3),
+                    "token_count": result.token_count,
+                    "validation_errors": errors,
+                    "meta": result.meta,
+                }
+            )
+            settle_runtime(model)
 
     elapsed = time.perf_counter() - benchmark_start
     payload = {
@@ -275,6 +306,10 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         "sample_count": len(samples),
         "seed": args.seed,
         "backend": model.backend_name,
+        "optimization": {
+            "kivi_kv_cache_requested_by_cli": bool(args.enable_kivi_kv_cache),
+            "kivi_kv_cache_enabled_by_env": kivi_env_enabled,
+        },
         "performance": {
             "avg_ttft_ms": round(sum(ttfts_ms) / len(ttfts_ms), 3) if ttfts_ms else None,
             "avg_throughput_tokens_per_sec": (

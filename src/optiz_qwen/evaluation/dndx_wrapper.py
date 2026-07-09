@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any
+
+from optiz_qwen.evaluation.answer_parsing import parse_choice_answer
 
 
 @dataclass
@@ -48,6 +52,7 @@ class VLMModel:
         self._processor = None
         self._tokenizer = None
         self._backend_name = "dummy"
+        self._kivi_config = None
 
         if backend in {"auto", "transformers"}:
             try:
@@ -77,6 +82,7 @@ class VLMModel:
             return self._generate_with_transformers(
                 image=image,
                 prompt=prompt,
+                choices=choices,
                 generation_config=generation_config,
             )
         return self._generate_with_dummy(
@@ -91,20 +97,51 @@ class VLMModel:
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
+        # Keep Windows console progress output readable by forcing ASCII bars.
+        os.environ.setdefault("TQDM_ASCII", "1")
+        self._install_transformers_log_filters()
+        normalized_device = (self.device or "auto").strip().lower()
+        dtype = torch.float32 if normalized_device == "cpu" else torch.bfloat16
         self._torch = torch
         self._processor = AutoProcessor.from_pretrained(
             self.model_path,
             local_files_only=True,
             trust_remote_code=True,
         )
+        model_kwargs = {
+            "local_files_only": True,
+            "trust_remote_code": True,
+            "dtype": dtype,
+        }
+        # Keep the baseline CPU path usable without forcing accelerate/device_map.
+        if normalized_device == "auto":
+            model_kwargs["device_map"] = "auto"
         self._model = AutoModelForImageTextToText.from_pretrained(
             self.model_path,
-            local_files_only=True,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            device_map=self.device,
-        ).eval()
+            **model_kwargs,
+        )
+        if normalized_device not in {"", "auto"}:
+            self._model = self._model.to(torch.device(normalized_device))
+        self._model = self._model.eval()
         self._tokenizer = getattr(self._processor, "tokenizer", None)
+
+    def _install_transformers_log_filters(self) -> None:
+        class _MessageFilter(logging.Filter):
+            def __init__(self, blocked_substrings: tuple[str, ...]) -> None:
+                super().__init__()
+                self.blocked_substrings = blocked_substrings
+
+            def filter(self, record: logging.LogRecord) -> bool:
+                message = record.getMessage()
+                return not any(token in message for token in self.blocked_substrings)
+
+        qwen_logger = logging.getLogger("transformers.models.qwen3_5.modeling_qwen3_5")
+        if not any(getattr(f, "_optiz_qwen_fast_path", False) for f in qwen_logger.filters):
+            fast_path_filter = _MessageFilter(
+                ("The fast path is not available because one of the required library is not installed.",)
+            )
+            fast_path_filter._optiz_qwen_fast_path = True
+            qwen_logger.addFilter(fast_path_filter)
 
     def _load_dummy_backend(self, reason: str) -> None:
         self._dummy_reason = reason
@@ -114,6 +151,7 @@ class VLMModel:
         *,
         image,
         prompt: str,
+        choices: dict[str, str],
         generation_config: GenerationConfig,
     ) -> GenerationResult:
         import torch
@@ -145,18 +183,26 @@ class VLMModel:
         generation_kwargs = {
             **inputs,
             "max_new_tokens": generation_config.max_new_tokens,
-            "temperature": generation_config.temperature,
-            "top_p": generation_config.top_p,
             "do_sample": generation_config.temperature > 0,
             "use_cache": True,
             "streamer": streamer,
         }
+        kivi_cache = self._build_kivi_cache_if_enabled()
+        if kivi_cache is not None:
+            generation_kwargs["past_key_values"] = kivi_cache
+        if generation_config.temperature > 0:
+            generation_kwargs["temperature"] = generation_config.temperature
+            generation_kwargs["top_p"] = generation_config.top_p
 
         output_holder: dict[str, Any] = {}
 
         def _run_generate() -> None:
-            with torch.no_grad():
-                output_holder["output_ids"] = self._model.generate(**generation_kwargs)
+            try:
+                with torch.no_grad():
+                    output_holder["output_ids"] = self._model.generate(**generation_kwargs)
+            except BaseException as exc:
+                output_holder["error"] = exc
+                streamer.end()
 
         worker = threading.Thread(target=_run_generate, daemon=True)
         start = time.perf_counter()
@@ -170,6 +216,8 @@ class VLMModel:
                 first_chunk_at = now
             chunks.append(chunk)
         worker.join()
+        if "error" in output_holder:
+            raise RuntimeError("Transformers generation failed inside the worker thread.") from output_holder["error"]
         end = time.perf_counter()
 
         output_ids = output_holder["output_ids"]
@@ -182,6 +230,25 @@ class VLMModel:
                 clean_up_tokenization_spaces=False,
             ).strip()
 
+        raw_text = text
+        parsed_answer, answer_source = parse_choice_answer(text, choices)
+        choice_fallback_meta = None
+        if parsed_answer is None and self._choice_fallback_enabled():
+            fallback_start = time.perf_counter()
+            parsed_answer, choice_fallback_meta = self._select_choice_by_logits(
+                image=image,
+                prompt=prompt,
+                choices=choices,
+            )
+            if parsed_answer is not None:
+                answer_source = "logit_choice_fallback"
+                text = f"Answer: {parsed_answer}"
+                if raw_text:
+                    text = f"{text}\nRaw response: {raw_text}"
+            end = time.perf_counter()
+            if first_chunk_at is None and parsed_answer is not None:
+                first_chunk_at = fallback_start
+
         ttft = (first_chunk_at - start) if first_chunk_at is not None else (end - start)
         return GenerationResult(
             text=text,
@@ -193,8 +260,81 @@ class VLMModel:
                 "input_image_size": input_image_size,
                 "image_grid_thw": image_grid_thw,
                 "image_token_count": image_token_count,
+                "kivi_kv_cache": kivi_cache.report().__dict__ if kivi_cache is not None else None,
+                "answer_source": answer_source,
+                "raw_text": raw_text,
+                "choice_fallback": choice_fallback_meta,
             },
         )
+
+    def _build_kivi_cache_if_enabled(self):
+        enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            return None
+        from optiz_qwen.compression import KiviConfig, build_qwen35_kivi_cache
+
+        kivi_config = KiviConfig(
+            k_bits=int(os.environ.get("OPTIZ_QWEN_KIVI_K_BITS", "2")),
+            v_bits=int(os.environ.get("OPTIZ_QWEN_KIVI_V_BITS", "2")),
+            group_size=int(os.environ.get("OPTIZ_QWEN_KIVI_GROUP_SIZE", "32")),
+            residual_length=int(os.environ.get("OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH", "32")),
+        )
+        return build_qwen35_kivi_cache(self._model.config, kivi_config)
+
+    def _choice_fallback_enabled(self) -> bool:
+        value = os.environ.get("OPTIZ_QWEN_CHOICE_FALLBACK", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _select_choice_by_logits(
+        self,
+        *,
+        image,
+        prompt: str,
+        choices: dict[str, str],
+    ) -> tuple[str | None, dict[str, Any]]:
+        usable_choices = [
+            key
+            for key, value in choices.items()
+            if key in {"A", "B", "C", "D"} and (value or "").strip()
+        ]
+        if not usable_choices:
+            usable_choices = ["A", "B", "C", "D"]
+
+        try:
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": f"{prompt.rstrip()}\nAnswer:"},
+                ],
+            }]
+            inputs = self._processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(self._model.device)
+            with self._torch.no_grad():
+                outputs = self._model(**inputs, use_cache=False)
+            logits = outputs.logits[0, -1, :]
+            scores = {}
+            for key in usable_choices:
+                token_ids = self._candidate_token_ids(key)
+                scores[key] = max(float(logits[token_id]) for token_id in token_ids)
+            picked = max(scores, key=scores.get)
+            return picked, {"enabled": True, "scores": scores}
+        except Exception as exc:
+            return None, {"enabled": True, "error": repr(exc)}
+
+    def _candidate_token_ids(self, choice: str) -> tuple[int, ...]:
+        tokenizer = self._tokenizer or self._processor.tokenizer
+        token_ids: list[int] = []
+        for variant in (choice, f" {choice}", f"{choice}.", f"({choice})"):
+            encoded = tokenizer.encode(variant, add_special_tokens=False)
+            if encoded:
+                token_ids.append(int(encoded[0]))
+        return tuple(dict.fromkeys(token_ids))
 
     def _generate_with_dummy(
         self,
