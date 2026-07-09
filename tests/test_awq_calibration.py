@@ -34,6 +34,10 @@ def write_tsv(path: Path, content: str) -> Path:
     return path
 
 
+def repo_relative_path(path: Path) -> Path:
+    return path.relative_to(Path(__file__).resolve().parents[1])
+
+
 def test_load_mmbench_calibration_records_builds_prompt_plan(
     workspace_tmp_dir: Path,
 ) -> None:
@@ -57,7 +61,7 @@ def test_load_mmbench_calibration_records_builds_prompt_plan(
         + "\n",
     )
 
-    records = load_mmbench_calibration_records(tsv)
+    records = load_mmbench_calibration_records(repo_relative_path(tsv))
 
     assert len(records) == 1
     record = records[0]
@@ -84,7 +88,7 @@ def test_load_mmbench_calibration_records_honors_max_samples(
         "2\timg-2\tQuestion two?\tRed\tBlue\tB\n",
     )
 
-    records = load_mmbench_calibration_records(tsv, max_samples=1)
+    records = load_mmbench_calibration_records(repo_relative_path(tsv), max_samples=1)
 
     assert [record.sample_id for record in records] == ["1"]
 
@@ -116,7 +120,7 @@ def test_load_mmbench_calibration_records_supports_missing_optional_fields(
         "7\t\tWhat is visible?\tText\tNothing\n",
     )
 
-    record = load_mmbench_calibration_records(tsv)[0]
+    record = load_mmbench_calibration_records(repo_relative_path(tsv))[0]
 
     assert record.sample_id == "7"
     assert record.options == {"A": "Text", "B": "Nothing"}
@@ -139,7 +143,7 @@ def test_build_prompt_text_keeps_options_in_abcd_order() -> None:
 
 
 def test_missing_tsv_has_clear_error(workspace_tmp_dir: Path) -> None:
-    missing = workspace_tmp_dir / "missing.tsv"
+    missing = repo_relative_path(workspace_tmp_dir / "missing.tsv")
 
     with pytest.raises(FileNotFoundError, match="MMBench TSV does not exist"):
         load_mmbench_calibration_records(missing)
@@ -149,14 +153,14 @@ def test_empty_tsv_has_clear_error(workspace_tmp_dir: Path) -> None:
     empty = write_tsv(workspace_tmp_dir / "empty.tsv", "")
 
     with pytest.raises(ValueError, match="MMBench TSV is empty"):
-        load_mmbench_calibration_records(empty)
+        load_mmbench_calibration_records(repo_relative_path(empty))
 
 
 def test_header_only_tsv_has_clear_error(workspace_tmp_dir: Path) -> None:
     tsv = write_tsv(workspace_tmp_dir / "header_only.tsv", "index\timage\tquestion\n")
 
     with pytest.raises(ValueError, match="contains no samples"):
-        load_mmbench_calibration_records(tsv)
+        load_mmbench_calibration_records(repo_relative_path(tsv))
 
 
 def test_max_samples_must_be_positive(workspace_tmp_dir: Path) -> None:
@@ -166,11 +170,27 @@ def test_max_samples_must_be_positive(workspace_tmp_dir: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="max_samples must be positive"):
-        load_mmbench_calibration_records(tsv, max_samples=0)
+        load_mmbench_calibration_records(repo_relative_path(tsv), max_samples=0)
 
 
 def test_missing_question_column_has_clear_error(workspace_tmp_dir: Path) -> None:
     tsv = write_tsv(workspace_tmp_dir / "bad_header.tsv", "index\timage\tA\n1\timg\tYes\n")
 
     with pytest.raises(ValueError, match="question"):
-        load_mmbench_calibration_records(tsv)
+        load_mmbench_calibration_records(repo_relative_path(tsv))
+
+
+def test_path_input_rejects_path_traversal() -> None:
+    with pytest.raises(ValueError, match="path traversal"):
+        load_mmbench_calibration_records(Path("../outside.tsv"))
+
+
+def test_path_input_rejects_absolute_path(workspace_tmp_dir: Path) -> None:
+    absolute_tsv = workspace_tmp_dir / "absolute.tsv"
+    with pytest.raises(ValueError, match="repository-relative"):
+        load_mmbench_calibration_records(absolute_tsv)
+
+
+def test_path_input_rejects_drive_relative_path() -> None:
+    with pytest.raises(ValueError, match="repository-relative"):
+        load_mmbench_calibration_records(Path("D:tmp/mmbench.tsv"))

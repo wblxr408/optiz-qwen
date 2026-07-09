@@ -1,15 +1,42 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
+
+import pytest
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT_DIR / "scripts" / "quantize_awq.py"
-MODEL_PATH = "resources/model_weights/raw/Qwen3.5-2B"
-CALIBRATION_TSV = "resources/eval_dataset/raw/mmbench_public/mmbench_dev_en.tsv"
 OUTPUT_DIR = "artifacts/quantized/qwen35_2b_awq_w4a16"
+
+
+@pytest.fixture()
+def cli_inputs() -> Iterator[dict[str, str]]:
+    root = ROOT_DIR / ".pytest-workspace-tmp" / uuid.uuid4().hex
+    model_dir = root / "fake_model"
+    calibration_tsv = root / "calibration.tsv"
+    model_dir.mkdir(parents=True)
+    calibration_tsv.write_text(
+        "index\timage\tquestion\tA\tB\tanswer\n"
+        "1\tfake-image\tWhich option is visible?\tLeft\tRight\tA\n",
+        encoding="utf-8",
+    )
+    try:
+        yield {
+            "model_path": model_dir.relative_to(ROOT_DIR).as_posix(),
+            "calibration_tsv": calibration_tsv.relative_to(ROOT_DIR).as_posix(),
+        }
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        try:
+            root.parent.rmdir()
+        except OSError:
+            pass
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
@@ -22,12 +49,14 @@ def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_dry_run_outputs_plan_without_creating_artifact() -> None:
+def test_dry_run_outputs_plan_without_creating_artifact(
+    cli_inputs: dict[str, str],
+) -> None:
     result = run_cli(
         "--model-path",
-        MODEL_PATH,
+        cli_inputs["model_path"],
         "--calibration-tsv",
-        CALIBRATION_TSV,
+        cli_inputs["calibration_tsv"],
         "--output-dir",
         OUTPUT_DIR,
         "--num-calibration-samples",
@@ -47,12 +76,12 @@ def test_dry_run_outputs_plan_without_creating_artifact() -> None:
     assert payload["metadata_preview"]["writes_artifacts"] is False
 
 
-def test_non_dry_run_is_rejected() -> None:
+def test_non_dry_run_is_rejected(cli_inputs: dict[str, str]) -> None:
     result = run_cli(
         "--model-path",
-        MODEL_PATH,
+        cli_inputs["model_path"],
         "--calibration-tsv",
-        CALIBRATION_TSV,
+        cli_inputs["calibration_tsv"],
         "--output-dir",
         OUTPUT_DIR,
     )
@@ -62,12 +91,14 @@ def test_non_dry_run_is_rejected() -> None:
     assert "real AWQ is not implemented" in result.stderr
 
 
-def test_output_dir_must_stay_under_awq_artifact_root() -> None:
+def test_output_dir_must_stay_under_awq_artifact_root(
+    cli_inputs: dict[str, str],
+) -> None:
     result = run_cli(
         "--model-path",
-        MODEL_PATH,
+        cli_inputs["model_path"],
         "--calibration-tsv",
-        CALIBRATION_TSV,
+        cli_inputs["calibration_tsv"],
         "--output-dir",
         "artifacts/quantized/other_model",
         "--dry-run",
@@ -77,12 +108,12 @@ def test_output_dir_must_stay_under_awq_artifact_root() -> None:
     assert "output_dir must be artifacts/quantized/qwen35_2b_awq_w4a16" in result.stderr
 
 
-def test_output_dir_must_be_repository_relative() -> None:
+def test_output_dir_must_be_repository_relative(cli_inputs: dict[str, str]) -> None:
     result = run_cli(
         "--model-path",
-        MODEL_PATH,
+        cli_inputs["model_path"],
         "--calibration-tsv",
-        CALIBRATION_TSV,
+        cli_inputs["calibration_tsv"],
         "--output-dir",
         "D:/tmp/qwen35_2b_awq_w4a16",
         "--dry-run",
@@ -92,12 +123,12 @@ def test_output_dir_must_be_repository_relative() -> None:
     assert "repository-relative" in result.stderr
 
 
-def test_output_dir_rejects_path_traversal() -> None:
+def test_output_dir_rejects_path_traversal(cli_inputs: dict[str, str]) -> None:
     result = run_cli(
         "--model-path",
-        MODEL_PATH,
+        cli_inputs["model_path"],
         "--calibration-tsv",
-        CALIBRATION_TSV,
+        cli_inputs["calibration_tsv"],
         "--output-dir",
         "artifacts/quantized/qwen35_2b_awq_w4a16/../escape",
         "--dry-run",
@@ -107,12 +138,12 @@ def test_output_dir_rejects_path_traversal() -> None:
     assert "path traversal" in result.stderr
 
 
-def test_drive_relative_paths_are_rejected() -> None:
+def test_drive_relative_paths_are_rejected(cli_inputs: dict[str, str]) -> None:
     result = run_cli(
         "--model-path",
-        MODEL_PATH,
+        cli_inputs["model_path"],
         "--calibration-tsv",
-        CALIBRATION_TSV,
+        cli_inputs["calibration_tsv"],
         "--output-dir",
         "D:tmp/qwen35_2b_awq_w4a16",
         "--dry-run",
@@ -122,12 +153,12 @@ def test_drive_relative_paths_are_rejected() -> None:
     assert "repository-relative" in result.stderr
 
 
-def test_missing_calibration_tsv_is_rejected() -> None:
+def test_missing_calibration_tsv_is_rejected(cli_inputs: dict[str, str]) -> None:
     result = run_cli(
         "--model-path",
-        MODEL_PATH,
+        cli_inputs["model_path"],
         "--calibration-tsv",
-        "resources/eval_dataset/raw/mmbench_public/missing.tsv",
+        ".pytest-workspace-tmp/missing.tsv",
         "--output-dir",
         OUTPUT_DIR,
         "--dry-run",

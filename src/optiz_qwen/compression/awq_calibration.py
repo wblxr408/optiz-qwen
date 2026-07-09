@@ -43,7 +43,12 @@ def _resolve_tsv_path(path: str | Path) -> Path:
             raise ValueError(f"tsv_path must not contain path traversal '..': {path}")
         resolved = REPO_ROOT / relative
     else:
-        resolved = path if path.is_absolute() else REPO_ROOT / path
+        windows_path = PureWindowsPath(str(path))
+        if path.is_absolute() or windows_path.drive:
+            raise ValueError(f"tsv_path Path must be repository-relative: {path}")
+        if ".." in path.parts:
+            raise ValueError(f"tsv_path must not contain path traversal '..': {path}")
+        resolved = REPO_ROOT / path
 
     if not resolved.exists():
         raise FileNotFoundError(f"MMBench TSV does not exist: {resolved}")
