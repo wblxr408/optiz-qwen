@@ -1,8 +1,8 @@
-"""Dry-run CLI for the planned AWQ W4A16 quantization workflow.
+"""CLI for AWQ W4A16 planning, preflight checks, and guarded execution.
 
-Phase 1 intentionally does not load models, import torch/transformers, install
-AutoAWQ, download assets, or write quantized artifacts. It validates inputs and
-prints the quantization plan that a later server-side implementation should run.
+Dry-run and preflight modes do not load models, import torch/transformers,
+install AutoAWQ, download assets, or write quantized artifacts. Real execution
+is only reachable via --execute plus --confirm-write-artifacts.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from optiz_qwen.compression.awq_backend import probe_awq_backend
+from optiz_qwen.compression.awq_execution import execute_autoawq_quantization
 
 DEFAULT_MODEL_PATH = "resources/model_weights/raw/Qwen3.5-2B"
 DEFAULT_CALIBRATION_TSV = "resources/eval_dataset/raw/mmbench_public/mmbench_dev_en.tsv"
@@ -63,7 +64,7 @@ def validate_output_dir(value: str) -> PurePosixPath:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Dry-run AWQ W4A16 quantization plan for Qwen3.5-2B VLM",
+        description="AWQ W4A16 quantization planner for Qwen3.5-2B VLM",
     )
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--calibration-tsv", default=DEFAULT_CALIBRATION_TSV)
@@ -74,19 +75,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--activation-dtype", default="bf16")
     parser.add_argument("--zero-point", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--backend", default="autoawq")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--confirm-write-artifacts", action="store_true")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--preflight", action="store_true")
+    mode.add_argument("--execute", action="store_true")
     return parser
 
 
-def build_plan(args: argparse.Namespace) -> dict[str, Any]:
+def validate_quantization_args(args: argparse.Namespace) -> None:
     if args.num_calibration_samples <= 0:
         raise ValueError("num_calibration_samples must be positive")
     if args.weight_bits != 4:
-        raise ValueError("Phase 1 AWQ plan only supports W4A16, so weight_bits must be 4")
+        raise ValueError("AWQ main path only supports W4A16, so weight_bits must be 4")
     if args.group_size <= 0:
         raise ValueError("group_size must be positive")
     if args.activation_dtype.lower() != "bf16":
-        raise ValueError("Phase 1 AWQ plan requires activation_dtype=bf16")
+        raise ValueError("AWQ W4A16 path requires activation_dtype=bf16")
+
+
+def build_preflight_payload(args: argparse.Namespace) -> dict[str, Any]:
+    validate_quantization_args(args)
 
     model_path = _resolve_existing_path(args.model_path, field_name="model_path")
     calibration_tsv = _resolve_existing_path(
@@ -97,14 +106,35 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     backend_readiness = probe_awq_backend(args.backend)
 
     return {
-        "phase": "awq_w4a16_dry_run",
-        "dry_run": True,
-        "status": "planned_only",
+        "mode": "preflight",
+        "backend": backend_readiness.to_dict(),
         "model_path": args.model_path,
         "model_path_resolved": str(model_path),
         "calibration_tsv": args.calibration_tsv,
         "calibration_tsv_resolved": str(calibration_tsv),
         "output_dir": output_dir.as_posix(),
+        "would_load_model": False,
+        "would_write_artifacts": False,
+        "can_execute": backend_readiness.package_available,
+        "performance_claim": "not_benchmarked",
+    }
+
+
+def build_plan(args: argparse.Namespace) -> dict[str, Any]:
+    validate_quantization_args(args)
+
+    preflight = build_preflight_payload(args)
+
+    return {
+        "phase": "awq_w4a16_dry_run",
+        "mode": "dry_run",
+        "dry_run": True,
+        "status": "planned_only",
+        "model_path": args.model_path,
+        "model_path_resolved": preflight["model_path_resolved"],
+        "calibration_tsv": args.calibration_tsv,
+        "calibration_tsv_resolved": preflight["calibration_tsv_resolved"],
+        "output_dir": preflight["output_dir"],
         "quantization": {
             "method": "awq",
             "scheme": "W4A16",
@@ -117,7 +147,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "source_format": "MMBench TSV",
             "sample_count": args.num_calibration_samples,
         },
-        "backend": backend_readiness.to_dict(),
+        "backend": preflight["backend"],
         "metadata_preview": {
             "artifact_status": "not_generated",
             "performance_claim": "not_benchmarked",
@@ -127,18 +157,47 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def execute_plan(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.confirm_write_artifacts:
+        raise ValueError(
+            "--execute requires --confirm-write-artifacts before real AWQ can run"
+        )
+
+    preflight = build_preflight_payload(args)
+    backend_readiness = probe_awq_backend(args.backend)
+    if not backend_readiness.package_available:
+        raise RuntimeError(
+            "AutoAWQ backend is not available according to preflight; real AWQ "
+            "execution cannot continue"
+        )
+
+    output_relative = validate_output_dir(args.output_dir)
+    return execute_autoawq_quantization(
+        model_path=Path(preflight["model_path_resolved"]),
+        calibration_tsv=Path(preflight["calibration_tsv_resolved"]),
+        output_dir=REPO_ROOT / Path(output_relative.as_posix()),
+        num_calibration_samples=args.num_calibration_samples,
+        weight_bits=args.weight_bits,
+        group_size=args.group_size,
+        activation_dtype=args.activation_dtype,
+        zero_point=args.zero_point,
+        confirm_write_artifacts=args.confirm_write_artifacts,
+        backend_readiness=backend_readiness,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not args.dry_run:
-        parser.error(
-            "current phase only supports --dry-run; real AWQ execution is not "
-            "implemented in this phase"
-        )
 
     try:
-        plan = build_plan(args)
-    except ValueError as exc:
+        if args.dry_run:
+            plan = build_plan(args)
+        elif args.preflight:
+            plan = build_preflight_payload(args)
+        else:
+            plan = execute_plan(args)
+    except (RuntimeError, ValueError) as exc:
         parser.error(str(exc))
 
     print(json.dumps(plan, indent=2, ensure_ascii=False))

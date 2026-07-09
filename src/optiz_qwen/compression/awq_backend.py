@@ -15,7 +15,7 @@ SUPPORTED_BACKENDS = {"autoawq"}
 
 @dataclass(frozen=True)
 class AWQBackendReadiness:
-    """Dry-run readiness metadata for a planned AWQ execution backend."""
+    """Readiness metadata for a planned AWQ execution backend."""
 
     backend_name: str
     package_available: bool
@@ -43,8 +43,9 @@ def probe_awq_backend(backend_name: str) -> AWQBackendReadiness:
         package_available = _package_available(("awq", "autoawq"))
         if package_available:
             reason = (
-                "AutoAWQ import target was found, but Phase 5 only performs a "
-                "readiness probe; real quantization is intentionally disabled."
+                "AutoAWQ import target was found by find_spec. This only means "
+                "the dependency may be importable; model support, CUDA readiness, "
+                "and artifact generation are still checked in the execute path."
             )
         else:
             reason = (
@@ -55,7 +56,7 @@ def probe_awq_backend(backend_name: str) -> AWQBackendReadiness:
         return AWQBackendReadiness(
             backend_name="autoawq",
             package_available=package_available,
-            can_quantize=False,
+            can_quantize=package_available,
             reason=reason,
             recommended_environment=(
                 "Use a dedicated Linux quantization host with a suitable NVIDIA GPU, "

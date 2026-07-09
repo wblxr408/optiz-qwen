@@ -16,7 +16,7 @@ def test_autoawq_probe_has_stable_readiness_shape() -> None:
     assert isinstance(readiness, AWQBackendReadiness)
     assert payload["backend_name"] == "autoawq"
     assert isinstance(payload["package_available"], bool)
-    assert payload["can_quantize"] is False
+    assert payload["can_quantize"] == payload["package_available"]
     assert payload["reason"]
     assert "recommended_environment" in payload
     assert "NVIDIA GPU" in payload["recommended_environment"]

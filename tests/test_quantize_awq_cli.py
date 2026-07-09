@@ -74,7 +74,7 @@ def test_dry_run_outputs_plan_without_creating_artifact(
     assert payload["quantization"]["activation_dtype"] == "bf16"
     assert payload["backend"]["backend_name"] == "autoawq"
     assert isinstance(payload["backend"]["package_available"], bool)
-    assert payload["backend"]["can_quantize"] is False
+    assert payload["backend"]["can_quantize"] == payload["backend"]["package_available"]
     assert payload["backend"]["reason"]
     assert payload["backend"]["recommended_environment"]
     assert payload["metadata_preview"]["performance_claim"] == "not_benchmarked"
@@ -98,10 +98,64 @@ def test_dry_run_accepts_explicit_autoawq_backend(cli_inputs: dict[str, str]) ->
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["backend"]["backend_name"] == "autoawq"
-    assert payload["backend"]["can_quantize"] is False
+    assert isinstance(payload["backend"]["can_quantize"], bool)
 
 
-def test_non_dry_run_is_rejected(cli_inputs: dict[str, str]) -> None:
+def test_preflight_outputs_json_without_creating_artifacts(cli_inputs: dict[str, str]) -> None:
+    result = run_cli(
+        "--model-path",
+        cli_inputs["model_path"],
+        "--calibration-tsv",
+        cli_inputs["calibration_tsv"],
+        "--output-dir",
+        OUTPUT_DIR,
+        "--preflight",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["mode"] == "preflight"
+    assert payload["model_path"] == cli_inputs["model_path"]
+    assert payload["calibration_tsv"] == cli_inputs["calibration_tsv"]
+    assert payload["output_dir"] == OUTPUT_DIR
+    assert payload["would_load_model"] is False
+    assert payload["would_write_artifacts"] is False
+    assert payload["can_execute"] == payload["backend"]["package_available"]
+    assert payload["performance_claim"] == "not_benchmarked"
+
+
+def test_execute_without_confirm_is_rejected(cli_inputs: dict[str, str]) -> None:
+    result = run_cli(
+        "--model-path",
+        cli_inputs["model_path"],
+        "--calibration-tsv",
+        cli_inputs["calibration_tsv"],
+        "--output-dir",
+        OUTPUT_DIR,
+        "--execute",
+    )
+
+    assert result.returncode != 0
+    assert "--confirm-write-artifacts" in result.stderr
+
+
+def test_modes_are_mutually_exclusive(cli_inputs: dict[str, str]) -> None:
+    result = run_cli(
+        "--model-path",
+        cli_inputs["model_path"],
+        "--calibration-tsv",
+        cli_inputs["calibration_tsv"],
+        "--output-dir",
+        OUTPUT_DIR,
+        "--dry-run",
+        "--preflight",
+    )
+
+    assert result.returncode != 0
+    assert "not allowed with argument" in result.stderr
+
+
+def test_mode_is_required(cli_inputs: dict[str, str]) -> None:
     result = run_cli(
         "--model-path",
         cli_inputs["model_path"],
@@ -112,8 +166,7 @@ def test_non_dry_run_is_rejected(cli_inputs: dict[str, str]) -> None:
     )
 
     assert result.returncode != 0
-    assert "only supports --dry-run" in result.stderr
-    assert "real AWQ execution is not implemented in this phase" in result.stderr
+    assert "one of the arguments --dry-run --preflight --execute is required" in result.stderr
 
 
 def test_unknown_backend_is_rejected(cli_inputs: dict[str, str]) -> None:
@@ -126,7 +179,7 @@ def test_unknown_backend_is_rejected(cli_inputs: dict[str, str]) -> None:
         OUTPUT_DIR,
         "--backend",
         "unknown_backend",
-        "--dry-run",
+        "--preflight",
     )
 
     assert result.returncode != 0
