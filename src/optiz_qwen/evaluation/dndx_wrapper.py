@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from optiz_qwen.evaluation.answer_parsing import parse_choice_answer
@@ -52,7 +53,7 @@ class VLMModel:
         self._processor = None
         self._tokenizer = None
         self._backend_name = "dummy"
-        self._kivi_config = None
+        self._resolved_device = "cpu"
 
         if backend in {"auto", "transformers"}:
             try:
@@ -94,33 +95,30 @@ class VLMModel:
 
     def _load_transformers_backend(self) -> None:
         import torch
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+        from transformers import AutoModelForMultimodalLM, AutoProcessor
+
+        model_dir = Path(self.model_path)
+        if not model_dir.exists():
+            raise FileNotFoundError(f"Local model path does not exist: {model_dir}")
 
         # Keep Windows console progress output readable by forcing ASCII bars.
         os.environ.setdefault("TQDM_ASCII", "1")
         self._install_transformers_log_filters()
-        normalized_device = (self.device or "auto").strip().lower()
-        dtype = torch.float32 if normalized_device == "cpu" else torch.bfloat16
         self._torch = torch
+        self._resolved_device = self._resolve_torch_device(torch)
         self._processor = AutoProcessor.from_pretrained(
             self.model_path,
             local_files_only=True,
             trust_remote_code=True,
         )
-        model_kwargs = {
-            "local_files_only": True,
-            "trust_remote_code": True,
-            "dtype": dtype,
-        }
-        # Keep the baseline CPU path usable without forcing accelerate/device_map.
-        if normalized_device == "auto":
-            model_kwargs["device_map"] = "auto"
-        self._model = AutoModelForImageTextToText.from_pretrained(
+        self._model = AutoModelForMultimodalLM.from_pretrained(
             self.model_path,
-            **model_kwargs,
+            local_files_only=True,
+            trust_remote_code=True,
+            dtype=self._resolve_torch_dtype(torch),
         )
-        if normalized_device not in {"", "auto"}:
-            self._model = self._model.to(torch.device(normalized_device))
+        if self._resolved_device != "cpu":
+            self._model = self._model.to(self._resolved_device)
         self._model = self._model.eval()
         self._tokenizer = getattr(self._processor, "tokenizer", None)
 
@@ -145,6 +143,46 @@ class VLMModel:
     def _load_dummy_backend(self, reason: str) -> None:
         self._dummy_reason = reason
 
+    def _resolve_torch_device(self, torch) -> str:
+        requested = (self.device or "auto").lower()
+        if requested == "auto":
+            return "cuda:0" if torch.cuda.is_available() else "cpu"
+        if requested.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but no CUDA device is available.")
+        return self.device
+
+    def _resolve_torch_dtype(self, torch):
+        if str(self._resolved_device).startswith("cuda"):
+            return torch.float16
+        return torch.float32
+
+    def _build_model_inputs(self, *, image, prompt: str):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        chat_text = self._processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = self._processor(
+            text=[chat_text],
+            images=[image],
+            padding=True,
+            return_tensors="pt",
+        )
+        model_device = getattr(self._model, "device", self._resolved_device)
+        return {
+            key: value.to(model_device) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
+
     def _generate_with_transformers(
         self,
         *,
@@ -156,32 +194,20 @@ class VLMModel:
         import torch
         from transformers import TextIteratorStreamer
 
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": prompt},
-            ],
-        }]
-        inputs = self._processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        ).to(self._model.device)
-        input_len = inputs.input_ids.shape[1]
+        inputs = self._build_model_inputs(image=image, prompt=prompt)
+        model_device = getattr(self._model, "device", self._resolved_device)
+        input_len = int(inputs["input_ids"].shape[1])
         streamer = TextIteratorStreamer(
-            self._processor.tokenizer,
+            self._tokenizer,
             skip_prompt=True,
             skip_special_tokens=True,
         )
         generation_kwargs = {
             **inputs,
             "max_new_tokens": generation_config.max_new_tokens,
-            "do_sample": generation_config.temperature > 0,
             "use_cache": True,
             "streamer": streamer,
+            "do_sample": generation_config.temperature > 0,
         }
         kivi_cache = self._build_kivi_cache_if_enabled()
         if kivi_cache is not None:
@@ -196,7 +222,7 @@ class VLMModel:
             try:
                 with torch.no_grad():
                     output_holder["output_ids"] = self._model.generate(**generation_kwargs)
-            except BaseException as exc:
+            except BaseException as exc:  # pragma: no cover - exercised in live runtime
                 output_holder["error"] = exc
                 streamer.end()
 
@@ -220,7 +246,7 @@ class VLMModel:
         generated_ids = output_ids[0][input_len:]
         text = "".join(chunks).strip()
         if not text:
-            text = self._processor.tokenizer.decode(
+            text = self._tokenizer.decode(
                 generated_ids,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
@@ -253,6 +279,8 @@ class VLMModel:
             elapsed_seconds=end - start,
             meta={
                 "backend": "transformers",
+                "device": str(model_device),
+                "model_path": self.model_path,
                 "kivi_kv_cache": kivi_cache.report().__dict__ if kivi_cache is not None else None,
                 "answer_source": answer_source,
                 "raw_text": raw_text,
@@ -294,20 +322,7 @@ class VLMModel:
             usable_choices = ["A", "B", "C", "D"]
 
         try:
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": f"{prompt.rstrip()}\nAnswer:"},
-                ],
-            }]
-            inputs = self._processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-            ).to(self._model.device)
+            inputs = self._build_model_inputs(image=image, prompt=f"{prompt.rstrip()}\nAnswer:")
             with self._torch.no_grad():
                 outputs = self._model(**inputs, use_cache=False)
             logits = outputs.logits[0, -1, :]

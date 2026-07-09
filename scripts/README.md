@@ -8,7 +8,8 @@ This directory is reserved for executable workflow entrypoints such as:
 - data-preparation helpers
 - benchmark collection
 
-At the current stage, only the skeleton exists because the external assets are still missing.
+At the current stage, model download and one-sample smoke-test helpers are in
+place, while the broader optimization workflow scripts are still skeletal.
 
 ## Model download
 
@@ -28,8 +29,15 @@ On Windows PowerShell, prefer `conda run --no-capture-output -n optiz-qwen ...`
 for benchmark commands so tqdm progress bars are streamed directly instead of
 being re-encoded by `conda run`.
 
-For local Mac development, install extra helper packages separately. These are
-not part of the organizer's minimal dependency list:
+For this local Windows GPU smoke-test environment, replace the CPU Torch wheel
+with the CUDA wheel overlay:
+
+```bash
+conda run -n optiz-qwen python -m pip install --force-reinstall -r configs/requirements/local_gpu_windows_cuda.txt
+```
+
+For local development, install extra helper packages separately. These are not
+part of the organizer's minimal dependency list:
 
 ```bash
 conda run -n optiz-qwen python -m pip install -r configs/requirements/local_dev_extra.txt
@@ -38,7 +46,7 @@ conda run -n optiz-qwen python -m pip install -r configs/requirements/local_dev_
 Then place weights in the repository's ignored raw-resource path:
 
 ```bash
-conda run -n optiz-qwen bash scripts/download_qwen35_2b_modelscope.sh
+conda run -n optiz-qwen python scripts/download_qwen35_2b_modelscope.py
 ```
 
 The target directory is `resources/model_weights/raw/Qwen3.5-2B/`.
@@ -88,3 +96,17 @@ python scripts/compare_benchmarks.py \
 Only the JSON format matters; file names are up to each developer. The PNG
 visualizes per-sample answer status changes, validation errors, TTFT deltas,
 throughput deltas, and generated-token deltas.
+
+## One-sample public benchmark smoke test
+
+After the model is downloaded, the baseline chain should be:
+
+1. model directory: `resources/model_weights/raw/Qwen3.5-2B/`
+2. wrapper: `evaluation_wrapper.py` -> `src/optiz_qwen/evaluation/dndx_wrapper.py`
+3. benchmark: `benchmark_public.py`
+
+Run one public sample on the local GPU with:
+
+```bash
+conda run -n optiz-qwen python benchmark_public.py --backend transformers --device cuda --num-samples 1
+```

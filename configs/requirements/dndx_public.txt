@@ -1,5 +1,14 @@
+# Organizer-compatible minimum runtime for the public DNDX self-test path.
+# Decision note:
+# - Option A: keep the plain PyPI `transformers` package.
+# - Option B: follow the official Qwen3.5 model card and use the latest
+#   Transformers main branch for the multimodal auto-loader.
+# Selected: Option B, because the public benchmark path must be able to load
+# `Qwen/Qwen3.5-2B` locally without relying on stale model-class mappings.
 torch
-transformers
+torchvision
+transformers @ git+https://github.com/huggingface/transformers.git@main
 accelerate
 Pillow
 numpy
+tiktoken
