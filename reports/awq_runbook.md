@@ -318,6 +318,67 @@ Add guarded execution plumbing now. Keeping dry-run only is weaker because it
 would postpone validation of the real artifact-writing entrypoint until the
 server run, where failures are costlier and harder to isolate.
 
+## Phase 7 Local AWQ Status and Smoke Report Skeleton
+
+Phase 7 adds `scripts/summarize_local_awq_status.py`, a dry-run/status CLI that
+summarizes local AWQ readiness without running a model.
+
+Example:
+
+```bash
+D:\Miniconda\envs\optiz-qwen\python.exe scripts/summarize_local_awq_status.py ^
+  --config configs/experiments/local_awq_smoke.yaml ^
+  --dry-run
+```
+
+The status JSON reports:
+
+- BF16 baseline path existence and size by filesystem metadata only
+- AWQ artifact path existence and size by filesystem metadata only
+- local `samples.jsonl` status and inspected JSONL record count
+- optional previously saved preflight JSON status
+- whether a future local BF16 vs AWQ smoke comparison has enough inputs to run
+- `performance_claim: not_benchmarked`
+
+If the AWQ artifact or `samples.jsonl` is missing, the script reports
+`artifact_missing` or `samples_status: missing` and exits successfully. Missing
+local smoke inputs are treated as not-run state, not benchmark failure.
+
+Phase 7 also adds `reports/local_awq_summary_template.md`. It is a template, not
+a result report. Fill it only after a real local BF16 vs AWQ smoke run.
+
+This phase does not:
+
+- load model weights
+- read or decode images
+- run inference
+- benchmark accuracy, TTFT, throughput, memory, or bandwidth
+- write artifacts or benchmark outputs
+- use the official competition evaluation dataset
+- touch `benchmark_public.py`
+- claim performance gains
+
+## Phase 7 Decision Note
+
+Candidate options:
+
+- Add a read-only status CLI and report template.
+- Wait for a real local smoke comparison runner before adding reporting.
+
+Evaluation dimensions:
+
+- Keeps the final local AWQ workflow inspectable without touching model files.
+- Separates status, smoke templates, and official benchmark reporting.
+- Makes missing artifacts and missing local samples explicit as not-run states.
+- Preserves `performance_claim: not_benchmarked`.
+
+Final choice:
+
+Add the read-only status CLI and template now. Waiting for a real comparison
+runner is weaker because local readiness can already be checked safely, while
+real inference and official benchmark work still require separate hardware,
+artifacts, and evaluation controls.
+
 ## Output Directory Rule
 
 The output directory must be repository-relative and must be either:
