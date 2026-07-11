@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from optiz_qwen.evaluation.answer_parsing import parse_choice_answer
+from optiz_qwen.compression import KiviConfig, QServeKvConfig
+from optiz_qwen.scheduling import build_kv_chain, run_greedy_prefill_decode
 
 
 @dataclass
@@ -215,47 +217,61 @@ class VLMModel:
             skip_prompt=True,
             skip_special_tokens=True,
         )
-        generation_kwargs = {
-            **inputs,
-            "max_new_tokens": generation_config.max_new_tokens,
-            "use_cache": True,
-            "streamer": streamer,
-            "do_sample": generation_config.temperature > 0,
-        }
-        kivi_cache = self._build_kivi_cache_if_enabled()
-        if kivi_cache is not None:
-            generation_kwargs["past_key_values"] = kivi_cache
-        if generation_config.temperature > 0:
-            generation_kwargs["temperature"] = generation_config.temperature
-            generation_kwargs["top_p"] = generation_config.top_p
+        kv_chain, kv_report = self._build_kv_chain_if_enabled()
+        use_prefill_decode = kv_chain is not None and generation_config.temperature == 0.0
+        if use_prefill_decode:
+            generated_ids, runtime_stats = run_greedy_prefill_decode(
+                self._model,
+                inputs,
+                max_new_tokens=generation_config.max_new_tokens,
+                tokenizer=self._tokenizer,
+                eos_token_id=getattr(self._tokenizer, "eos_token_id", None),
+                kivi_cache=kv_chain,
+            )
+            start = time.perf_counter()
+            first_chunk_at = start + runtime_stats.ttft_seconds
+            chunks = []
+            output_ids = torch.cat([inputs.input_ids, generated_ids], dim=-1)
+            end = start + runtime_stats.elapsed_seconds
+        else:
+            generation_kwargs = {
+                **inputs,
+                "max_new_tokens": generation_config.max_new_tokens,
+                "use_cache": True,
+                "streamer": streamer,
+                "do_sample": generation_config.temperature > 0,
+            }
+            if generation_config.temperature > 0:
+                generation_kwargs["temperature"] = generation_config.temperature
+                generation_kwargs["top_p"] = generation_config.top_p
 
-        output_holder: dict[str, Any] = {}
+            output_holder: dict[str, Any] = {}
 
-        def _run_generate() -> None:
-            try:
-                with torch.no_grad():
-                    output_holder["output_ids"] = self._model.generate(**generation_kwargs)
-            except BaseException as exc:  # pragma: no cover - exercised in live runtime
-                output_holder["error"] = exc
-                streamer.end()
+            def _run_generate() -> None:
+                try:
+                    with torch.no_grad():
+                        output_holder["output_ids"] = self._model.generate(**generation_kwargs)
+                except BaseException as exc:  # pragma: no cover - exercised in live runtime
+                    output_holder["error"] = exc
+                    streamer.end()
 
-        worker = threading.Thread(target=_run_generate, daemon=True)
-        start = time.perf_counter()
-        worker.start()
+            worker = threading.Thread(target=_run_generate, daemon=True)
+            start = time.perf_counter()
+            worker.start()
 
-        first_chunk_at = None
-        chunks: list[str] = []
-        for chunk in streamer:
-            now = time.perf_counter()
-            if first_chunk_at is None and chunk:
-                first_chunk_at = now
-            chunks.append(chunk)
-        worker.join()
-        if "error" in output_holder:
-            raise RuntimeError("Transformers generation failed inside the worker thread.") from output_holder["error"]
-        end = time.perf_counter()
-
-        output_ids = output_holder["output_ids"]
+            first_chunk_at = None
+            chunks: list[str] = []
+            for chunk in streamer:
+                now = time.perf_counter()
+                if first_chunk_at is None and chunk:
+                    first_chunk_at = now
+                chunks.append(chunk)
+            worker.join()
+            if "error" in output_holder:
+                raise RuntimeError("Transformers generation failed inside the worker thread.") from output_holder["error"]
+            end = time.perf_counter()
+            output_ids = output_holder["output_ids"]
+            runtime_stats = None
         generated_ids = output_ids[0][input_len:]
         text = "".join(chunks).strip()
         if not text:
@@ -292,26 +308,53 @@ class VLMModel:
             elapsed_seconds=end - start,
             meta={
                 "backend": "transformers",
-                "kivi_kv_cache": kivi_cache.report().__dict__ if kivi_cache is not None else None,
+                "kv_chain": kv_report.__dict__ if kv_report is not None else None,
+                "prefill_decode_runtime": runtime_stats.__dict__ if runtime_stats is not None else None,
                 "answer_source": answer_source,
                 "raw_text": raw_text,
                 "choice_fallback": choice_fallback_meta,
             },
         )
 
-    def _build_kivi_cache_if_enabled(self):
-        enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower()
-        if enabled not in {"1", "true", "yes", "on"}:
-            return None
-        from optiz_qwen.compression import KiviConfig, build_qwen35_kivi_cache
+    def _build_kv_chain_if_enabled(self):
+        enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower()
+        chain_name = None
+        if enabled in {"1", "true", "yes", "on"}:
+            chain_name = os.environ.get("OPTIZ_QWEN_KV_CHAIN", "qserve_kv").strip().lower()
+        else:
+            legacy_enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower()
+            if legacy_enabled not in {"1", "true", "yes", "on"}:
+                return None, None
+            chain_name = "legacy_kivi"
 
         kivi_config = KiviConfig(
-            k_bits=int(os.environ.get("OPTIZ_QWEN_KIVI_K_BITS", "2")),
-            v_bits=int(os.environ.get("OPTIZ_QWEN_KIVI_V_BITS", "2")),
-            group_size=int(os.environ.get("OPTIZ_QWEN_KIVI_GROUP_SIZE", "32")),
-            residual_length=int(os.environ.get("OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH", "32")),
+            k_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_K_BITS", os.environ.get("OPTIZ_QWEN_KIVI_K_BITS", "2"))),
+            v_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_V_BITS", os.environ.get("OPTIZ_QWEN_KIVI_V_BITS", "2"))),
+            group_size=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE", os.environ.get("OPTIZ_QWEN_KIVI_GROUP_SIZE", "32"))),
+            residual_length=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH", os.environ.get("OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH", "32"))),
         )
-        return build_qwen35_kivi_cache(self._model.config, kivi_config)
+        qserve_config = None
+        if chain_name == "qserve_kv":
+            qserve_config = QServeKvConfig(
+                k_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_K_BITS", "4")),
+                v_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_V_BITS", "4")),
+                group_size=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE", "32")),
+                residual_length=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH", "32")),
+            )
+        kv_chain, kv_report = build_kv_chain(
+            chain_name=chain_name,
+            model_config=self._model.config,
+            enabled=True,
+            kivi_config=kivi_config,
+            qserve_config=qserve_config,
+        )
+        return kv_chain, kv_report
+
+    def _build_kivi_cache_if_enabled(self):
+        kv_chain, kv_report = self._build_kv_chain_if_enabled()
+        if kv_report is None or kv_report.chain_name != "legacy_kivi":
+            return None
+        return kv_chain
 
     def _choice_fallback_enabled(self) -> bool:
         value = os.environ.get("OPTIZ_QWEN_CHOICE_FALLBACK", "1").strip().lower()

@@ -11,6 +11,7 @@ from optiz_qwen.evaluation.dndx_public_benchmark import (
     compute_throughput,
     extract_answer,
     kivi_cli_environment,
+    kv_chain_cli_environment,
 )
 
 
@@ -79,3 +80,27 @@ def test_kivi_cli_environment_sets_and_restores_env(monkeypatch) -> None:
     import os
 
     assert "OPTIZ_QWEN_KIVI_KV_CACHE" not in os.environ
+
+
+def test_kv_chain_cli_environment_sets_and_restores_env(monkeypatch) -> None:
+    monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN_ENABLED", raising=False)
+    monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN", raising=False)
+    args = Namespace(
+        enable_kv_chain=True,
+        kv_chain="qserve_kv",
+        kv_chain_k_bits=4,
+        kv_chain_v_bits=4,
+        kv_chain_group_size=32,
+        kv_chain_residual_length=32,
+    )
+
+    with kv_chain_cli_environment(args):
+        import os
+
+        assert os.environ["OPTIZ_QWEN_KV_CHAIN_ENABLED"] == "1"
+        assert os.environ["OPTIZ_QWEN_KV_CHAIN"] == "qserve_kv"
+
+    import os
+
+    assert "OPTIZ_QWEN_KV_CHAIN_ENABLED" not in os.environ
+    assert "OPTIZ_QWEN_KV_CHAIN" not in os.environ

@@ -31,6 +31,14 @@ KIVI_ENV_KEYS = (
     "OPTIZ_QWEN_KIVI_GROUP_SIZE",
     "OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH",
 )
+KV_CHAIN_ENV_KEYS = (
+    "OPTIZ_QWEN_KV_CHAIN_ENABLED",
+    "OPTIZ_QWEN_KV_CHAIN",
+    "OPTIZ_QWEN_KV_CHAIN_K_BITS",
+    "OPTIZ_QWEN_KV_CHAIN_V_BITS",
+    "OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE",
+    "OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH",
+)
 
 
 @dataclass
@@ -75,6 +83,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kivi-v-bits", type=int, default=2)
     parser.add_argument("--kivi-group-size", type=int, default=32)
     parser.add_argument("--kivi-residual-length", type=int, default=32)
+    parser.add_argument("--enable-kv-chain", action="store_true")
+    parser.add_argument("--kv-chain", type=str, default="qserve_kv")
+    parser.add_argument("--kv-chain-k-bits", type=int, default=4)
+    parser.add_argument("--kv-chain-v-bits", type=int, default=4)
+    parser.add_argument("--kv-chain-group-size", type=int, default=32)
+    parser.add_argument("--kv-chain-residual-length", type=int, default=32)
     return parser.parse_args()
 
 
@@ -203,6 +217,26 @@ def kivi_cli_environment(args: argparse.Namespace):
                 os.environ[key] = value
 
 
+@contextmanager
+def kv_chain_cli_environment(args: argparse.Namespace):
+    previous = {key: os.environ.get(key) for key in KV_CHAIN_ENV_KEYS}
+    if getattr(args, "enable_kv_chain", False):
+        os.environ["OPTIZ_QWEN_KV_CHAIN_ENABLED"] = "1"
+        os.environ["OPTIZ_QWEN_KV_CHAIN"] = str(getattr(args, "kv_chain", "qserve_kv"))
+        os.environ["OPTIZ_QWEN_KV_CHAIN_K_BITS"] = str(getattr(args, "kv_chain_k_bits", 2))
+        os.environ["OPTIZ_QWEN_KV_CHAIN_V_BITS"] = str(getattr(args, "kv_chain_v_bits", 4))
+        os.environ["OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE"] = str(getattr(args, "kv_chain_group_size", 32))
+        os.environ["OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH"] = str(getattr(args, "kv_chain_residual_length", 32))
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def run_benchmark(args: argparse.Namespace) -> dict:
     benchmark_start = time.perf_counter()
     random.seed(args.seed)
@@ -224,13 +258,10 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         raise ValueError(f"No samples loaded from {dataset_path}")
 
     kivi_env_enabled = False
-    with kivi_cli_environment(args):
-        kivi_env_enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+    kv_chain_env_enabled = False
+    with kivi_cli_environment(args), kv_chain_cli_environment(args):
+        kivi_env_enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}
+        kv_chain_env_enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
         model = VLMModel(args.model_path, backend=args.backend, device=args.device)
 
         for sample in samples[: min(args.warmup_samples, len(samples))]:
@@ -309,6 +340,9 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         "optimization": {
             "kivi_kv_cache_requested_by_cli": bool(args.enable_kivi_kv_cache),
             "kivi_kv_cache_enabled_by_env": kivi_env_enabled,
+            "kv_chain_requested_by_cli": bool(getattr(args, "enable_kv_chain", False)),
+            "kv_chain_enabled_by_env": kv_chain_env_enabled,
+            "kv_chain_name": getattr(args, "kv_chain", None) if kv_chain_env_enabled else None,
         },
         "performance": {
             "avg_ttft_ms": round(sum(ttfts_ms) / len(ttfts_ms), 3) if ttfts_ms else None,

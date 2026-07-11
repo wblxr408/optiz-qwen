@@ -243,6 +243,12 @@ def load_upstream_kivi_model_class(
         )
 
     module_name, class_name = SUPPORTED_UPSTREAM_MODEL_FAMILIES[normalized_family]
+    previous_modules = {
+        name: sys.modules.get(name)
+        for name in ("models", module_name)
+    }
+    for name in previous_modules:
+        sys.modules.pop(name, None)
     with _temporary_sys_path(status.path):
         try:
             module = importlib.import_module(module_name)
@@ -252,6 +258,11 @@ def load_upstream_kivi_model_class(
                 "Install the upstream package and its quant CUDA extension before "
                 "using real KIVI inference."
             ) from exc
+    for name, previous in previous_modules.items():
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
     return getattr(module, class_name)
 
 
@@ -270,15 +281,27 @@ def load_upstream_quant_module(source_path: str | Path | None = None) -> Any:
             f"path={status.path}; missing={list(status.missing_files)}. "
             "Run scripts/prepare_kivi_upstream.ps1 first."
         )
+    previous_modules = {
+        name: sys.modules.get(name)
+        for name in ("quant", "quant.new_pack")
+    }
+    for name in previous_modules:
+        sys.modules.pop(name, None)
     with _temporary_sys_path(status.path):
         try:
-            return importlib.import_module("quant.new_pack")
+            module = importlib.import_module("quant.new_pack")
         except Exception as exc:  # pragma: no cover - depends on optional Triton deps
             raise KiviIntegrationError(
                 "Found upstream KIVI source, but importing quant.new_pack failed. "
                 "Install upstream KIVI dependencies such as triton before using "
                 "real KV-cache pack/unpack functions."
             ) from exc
+    for name, previous in previous_modules.items():
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+    return module
 
 
 def _config_value(config: Any, key: str) -> Any:
