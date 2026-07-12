@@ -41,6 +41,11 @@ KV_CHAIN_ENV_KEYS = (
 )
 RUNNER_ENV_KEYS = ("OPTIZ_QWEN_GENERATION_RUNNER",)
 VISUAL_ENV_KEYS = ("OPTIZ_QWEN_VISUAL_PIXEL_BUDGET",)
+TOME_ENV_KEYS = (
+    "OPTIZ_QWEN_TOME_ENABLED",
+    "OPTIZ_QWEN_TOME_LAYER",
+    "OPTIZ_QWEN_TOME_R",
+)
 
 
 @dataclass
@@ -94,6 +99,9 @@ def parse_args() -> argparse.Namespace:
         help="Use greedy for a runner-identical baseline versus KV-chain comparison.",
     )
     parser.add_argument("--visual-pixel-budget", type=int, default=None)
+    parser.add_argument("--enable-tome", action="store_true")
+    parser.add_argument("--tome-layer", type=int, default=12)
+    parser.add_argument("--tome-r", type=int, default=1)
     parser.add_argument(
         "--enable-kivi-kv-cache",
         action="store_true",
@@ -330,6 +338,26 @@ def visual_cli_environment(args: argparse.Namespace):
                 os.environ[key] = value
 
 
+@contextmanager
+def tome_cli_environment(args: argparse.Namespace):
+    previous = {key: os.environ.get(key) for key in TOME_ENV_KEYS}
+    if getattr(args, "enable_tome", False):
+        os.environ["OPTIZ_QWEN_TOME_ENABLED"] = "1"
+        os.environ["OPTIZ_QWEN_TOME_LAYER"] = str(getattr(args, "tome_layer", 12))
+        os.environ["OPTIZ_QWEN_TOME_R"] = str(getattr(args, "tome_r", 1))
+    else:
+        for key in TOME_ENV_KEYS:
+            os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def run_benchmark(args: argparse.Namespace) -> dict:
     benchmark_start = time.perf_counter()
     random.seed(args.seed)
@@ -369,6 +397,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         kv_chain_cli_environment(args),
         runner_cli_environment(args),
         visual_cli_environment(args),
+        tome_cli_environment(args),
     ):
         kivi_env_enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}
         kv_chain_env_enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -460,6 +489,9 @@ def run_benchmark(args: argparse.Namespace) -> dict:
                 if getattr(args, "visual_pixel_budget", None) is not None
                 else None
             ),
+            "tome_enabled": bool(getattr(args, "enable_tome", False)),
+            "tome_layer": getattr(args, "tome_layer", None) if getattr(args, "enable_tome", False) else None,
+            "tome_r": getattr(args, "tome_r", None) if getattr(args, "enable_tome", False) else None,
             "kivi_kv_cache_requested_by_cli": bool(args.enable_kivi_kv_cache),
             "kivi_kv_cache_enabled_by_env": kivi_env_enabled,
             "kv_chain_requested_by_cli": bool(getattr(args, "enable_kv_chain", False)),

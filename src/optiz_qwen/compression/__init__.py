@@ -19,6 +19,14 @@ from optiz_qwen.compression.qwen35_kivi_cache import (
     Qwen35KiviCacheReport,
     build_qwen35_kivi_cache,
 )
+from optiz_qwen.compression.qwen35_tome import (
+    Qwen35TomeConfig,
+    Qwen35TomeRuntime,
+    get_qwen35_tome_runtime,
+    install_qwen35_tome,
+    set_qwen35_tome_enabled,
+)
+from optiz_qwen.compression.tome import TomeMergeResult, merge_single_visual_sample, merge_visual_units
 from optiz_qwen.compression.qserve_kv_cache import (
     QServeAttentionLayer,
     QServeFusedAttentionLayer,
@@ -39,12 +47,15 @@ __all__ = [
     "KiviUnsupportedModelError",
     "Qwen35KiviCache",
     "Qwen35KiviCacheReport",
+    "Qwen35TomeConfig",
+    "Qwen35TomeRuntime",
     "QServeAttentionLayer",
     "QServeFusedAttentionLayer",
     "QServeFusedKvCache",
     "QServeKvCache",
     "QServeKvCacheReport",
     "QServeKvConfig",
+    "TomeMergeResult",
     "apply_kivi_config_to_transformers_config",
     "build_qwen35_kivi_cache",
     "build_qserve_kv_cache",
@@ -52,6 +63,11 @@ __all__ = [
     "infer_upstream_model_family",
     "inspect_kivi_source",
     "inspect_qb_matmul_kernel",
+    "get_qwen35_tome_runtime",
+    "install_qwen35_tome",
+    "set_qwen35_tome_enabled",
     "load_upstream_kivi_model_class",
     "load_upstream_quant_module",
+    "merge_visual_units",
+    "merge_single_visual_sample",
 ]

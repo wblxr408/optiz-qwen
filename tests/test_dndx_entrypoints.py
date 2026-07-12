@@ -15,6 +15,7 @@ from optiz_qwen.evaluation.dndx_public_benchmark import (
     Sample,
     select_samples,
     runner_cli_environment,
+    tome_cli_environment,
     visual_cli_environment,
 )
 
@@ -150,6 +151,22 @@ def test_runner_and_visual_environments_are_scoped(monkeypatch) -> None:
 
     assert "OPTIZ_QWEN_GENERATION_RUNNER" not in os.environ
     assert "OPTIZ_QWEN_VISUAL_PIXEL_BUDGET" not in os.environ
+
+
+def test_tome_cli_environment_is_explicit_and_scoped(monkeypatch) -> None:
+    import os
+
+    monkeypatch.setenv("OPTIZ_QWEN_TOME_ENABLED", "1")
+    disabled_args = Namespace(enable_tome=False)
+    with tome_cli_environment(disabled_args):
+        assert "OPTIZ_QWEN_TOME_ENABLED" not in os.environ
+    assert os.environ["OPTIZ_QWEN_TOME_ENABLED"] == "1"
+
+    enabled_args = Namespace(enable_tome=True, tome_layer=8, tome_r=2)
+    with tome_cli_environment(enabled_args):
+        assert os.environ["OPTIZ_QWEN_TOME_ENABLED"] == "1"
+        assert os.environ["OPTIZ_QWEN_TOME_LAYER"] == "8"
+        assert os.environ["OPTIZ_QWEN_TOME_R"] == "2"
 
 
 def test_stratified_sample_selection_is_balanced_and_reproducible() -> None:
