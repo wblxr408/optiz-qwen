@@ -31,6 +31,16 @@ KIVI_ENV_KEYS = (
     "OPTIZ_QWEN_KIVI_GROUP_SIZE",
     "OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH",
 )
+KV_CHAIN_ENV_KEYS = (
+    "OPTIZ_QWEN_KV_CHAIN_ENABLED",
+    "OPTIZ_QWEN_KV_CHAIN",
+    "OPTIZ_QWEN_KV_CHAIN_K_BITS",
+    "OPTIZ_QWEN_KV_CHAIN_V_BITS",
+    "OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE",
+    "OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH",
+)
+RUNNER_ENV_KEYS = ("OPTIZ_QWEN_GENERATION_RUNNER",)
+VISUAL_ENV_KEYS = ("OPTIZ_QWEN_VISUAL_PIXEL_BUDGET",)
 
 
 @dataclass
@@ -57,6 +67,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--num-samples", type=int, default=None)
+    parser.add_argument(
+        "--sample-strategy",
+        choices=["sequential", "stratified"],
+        default="sequential",
+    )
+    parser.add_argument(
+        "--categories",
+        type=str,
+        default=None,
+        help="Comma-separated exact category names to include before sampling.",
+    )
     parser.add_argument("--seed", type=int, default=20260625)
     parser.add_argument(
         "--backend",
@@ -67,6 +88,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-samples", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument(
+        "--generation-runner",
+        choices=["generate", "greedy"],
+        default="generate",
+        help="Use greedy for a runner-identical baseline versus KV-chain comparison.",
+    )
+    parser.add_argument("--visual-pixel-budget", type=int, default=None)
+    parser.add_argument(
         "--enable-kivi-kv-cache",
         action="store_true",
         help="Enable the local Qwen3.5 KIVI KV-cache adapter for this run.",
@@ -75,6 +103,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kivi-v-bits", type=int, default=2)
     parser.add_argument("--kivi-group-size", type=int, default=32)
     parser.add_argument("--kivi-residual-length", type=int, default=32)
+    parser.add_argument("--enable-kv-chain", action="store_true")
+    parser.add_argument("--kv-chain", type=str, default="qserve_kv")
+    parser.add_argument("--kv-chain-k-bits", type=int, default=4)
+    parser.add_argument("--kv-chain-v-bits", type=int, default=4)
+    parser.add_argument("--kv-chain-group-size", type=int, default=32)
+    parser.add_argument("--kv-chain-residual-length", type=int, default=32)
     return parser.parse_args()
 
 
@@ -100,6 +134,43 @@ def load_mmbench_tsv(path: Path, limit: int | None = None) -> list[Sample]:
             if limit is not None and len(samples) >= limit:
                 break
     return samples
+
+
+def select_samples(
+    samples: list[Sample],
+    *,
+    limit: int | None,
+    strategy: str,
+    seed: int,
+    categories: set[str] | None = None,
+) -> list[Sample]:
+    selected = [sample for sample in samples if categories is None or sample.category in categories]
+    if strategy == "sequential":
+        return selected if limit is None else selected[:limit]
+    if strategy != "stratified":
+        raise ValueError(f"unsupported sample strategy: {strategy}")
+
+    buckets: dict[str, list[Sample]] = {}
+    for sample in selected:
+        buckets.setdefault(sample.category, []).append(sample)
+    rng = random.Random(seed)
+    for bucket in buckets.values():
+        rng.shuffle(bucket)
+
+    result: list[Sample] = []
+    category_names = sorted(buckets)
+    while category_names and (limit is None or len(result) < limit):
+        next_names = []
+        for category in category_names:
+            bucket = buckets[category]
+            if bucket:
+                result.append(bucket.pop())
+                if limit is not None and len(result) >= limit:
+                    break
+            if bucket:
+                next_names.append(category)
+        category_names = next_names
+    return result
 
 
 def decode_image(image_b64: str) -> Image.Image:
@@ -203,6 +274,56 @@ def kivi_cli_environment(args: argparse.Namespace):
                 os.environ[key] = value
 
 
+@contextmanager
+def kv_chain_cli_environment(args: argparse.Namespace):
+    previous = {key: os.environ.get(key) for key in KV_CHAIN_ENV_KEYS}
+    if getattr(args, "enable_kv_chain", False):
+        os.environ["OPTIZ_QWEN_KV_CHAIN_ENABLED"] = "1"
+        os.environ["OPTIZ_QWEN_KV_CHAIN"] = str(getattr(args, "kv_chain", "qserve_kv"))
+        os.environ["OPTIZ_QWEN_KV_CHAIN_K_BITS"] = str(getattr(args, "kv_chain_k_bits", 2))
+        os.environ["OPTIZ_QWEN_KV_CHAIN_V_BITS"] = str(getattr(args, "kv_chain_v_bits", 4))
+        os.environ["OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE"] = str(getattr(args, "kv_chain_group_size", 32))
+        os.environ["OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH"] = str(getattr(args, "kv_chain_residual_length", 32))
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
+def runner_cli_environment(args: argparse.Namespace):
+    previous = {key: os.environ.get(key) for key in RUNNER_ENV_KEYS}
+    os.environ["OPTIZ_QWEN_GENERATION_RUNNER"] = str(getattr(args, "generation_runner", "generate"))
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
+def visual_cli_environment(args: argparse.Namespace):
+    previous = {key: os.environ.get(key) for key in VISUAL_ENV_KEYS}
+    budget = getattr(args, "visual_pixel_budget", None)
+    if budget is not None:
+        os.environ["OPTIZ_QWEN_VISUAL_PIXEL_BUDGET"] = str(budget)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def run_benchmark(args: argparse.Namespace) -> dict:
     benchmark_start = time.perf_counter()
     random.seed(args.seed)
@@ -219,18 +340,32 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     output_path = Path(args.output).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    samples = load_mmbench_tsv(dataset_path, limit=args.num_samples)
+    all_samples = load_mmbench_tsv(dataset_path)
+    category_filter = None
+    if getattr(args, "categories", None):
+        category_filter = {
+            value.strip() for value in str(args.categories).split(",") if value.strip()
+        }
+    samples = select_samples(
+        all_samples,
+        limit=args.num_samples,
+        strategy=getattr(args, "sample_strategy", "sequential"),
+        seed=args.seed,
+        categories=category_filter,
+    )
     if not samples:
         raise ValueError(f"No samples loaded from {dataset_path}")
 
     kivi_env_enabled = False
-    with kivi_cli_environment(args):
-        kivi_env_enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+    kv_chain_env_enabled = False
+    with (
+        kivi_cli_environment(args),
+        kv_chain_cli_environment(args),
+        runner_cli_environment(args),
+        visual_cli_environment(args),
+    ):
+        kivi_env_enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}
+        kv_chain_env_enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
         model = VLMModel(args.model_path, backend=args.backend, device=args.device)
 
         for sample in samples[: min(args.warmup_samples, len(samples))]:
@@ -305,10 +440,25 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         "dataset_path": str(dataset_path),
         "sample_count": len(samples),
         "seed": args.seed,
+        "sample_selection": {
+            "strategy": getattr(args, "sample_strategy", "sequential"),
+            "categories": sorted(category_filter) if category_filter is not None else None,
+            "source_sample_count": len(all_samples),
+        },
         "backend": model.backend_name,
         "optimization": {
+            "generation_runner": getattr(args, "generation_runner", "generate"),
+            "visual_pixel_budget": getattr(args, "visual_pixel_budget", None),
+            "visual_accuracy_risk": (
+                "OCR and fine-grained localization require accuracy validation"
+                if getattr(args, "visual_pixel_budget", None) is not None
+                else None
+            ),
             "kivi_kv_cache_requested_by_cli": bool(args.enable_kivi_kv_cache),
             "kivi_kv_cache_enabled_by_env": kivi_env_enabled,
+            "kv_chain_requested_by_cli": bool(getattr(args, "enable_kv_chain", False)),
+            "kv_chain_enabled_by_env": kv_chain_env_enabled,
+            "kv_chain_name": getattr(args, "kv_chain", None) if kv_chain_env_enabled else None,
         },
         "performance": {
             "avg_ttft_ms": round(sum(ttfts_ms) / len(ttfts_ms), 3) if ttfts_ms else None,

@@ -7,9 +7,12 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from optiz_qwen.evaluation.answer_parsing import parse_choice_answer
+from optiz_qwen.compression import KiviConfig, QServeKvConfig
+from optiz_qwen.scheduling import build_kv_chain, run_greedy_prefill_decode
 
 
 @dataclass
@@ -52,7 +55,7 @@ class VLMModel:
         self._processor = None
         self._tokenizer = None
         self._backend_name = "dummy"
-        self._kivi_config = None
+        self._resolved_device = "cpu"
 
         if backend in {"auto", "transformers"}:
             try:
@@ -95,35 +98,47 @@ class VLMModel:
 
     def _load_transformers_backend(self) -> None:
         import torch
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+        from transformers import AutoModelForMultimodalLM, AutoProcessor
+
+        model_dir = Path(self.model_path)
+        if not model_dir.exists():
+            raise FileNotFoundError(f"Local model path does not exist: {model_dir}")
 
         # Keep Windows console progress output readable by forcing ASCII bars.
         os.environ.setdefault("TQDM_ASCII", "1")
         self._install_transformers_log_filters()
-        normalized_device = (self.device or "auto").strip().lower()
-        dtype = torch.float32 if normalized_device == "cpu" else torch.bfloat16
         self._torch = torch
+        self._resolved_device = self._resolve_torch_device(torch)
         self._processor = AutoProcessor.from_pretrained(
             self.model_path,
             local_files_only=True,
             trust_remote_code=True,
         )
-        model_kwargs = {
-            "local_files_only": True,
-            "trust_remote_code": True,
-            "dtype": dtype,
-        }
-        # Keep the baseline CPU path usable without forcing accelerate/device_map.
-        if normalized_device == "auto":
-            model_kwargs["device_map"] = "auto"
-        self._model = AutoModelForImageTextToText.from_pretrained(
+        self._configure_visual_token_budget()
+        self._model = AutoModelForMultimodalLM.from_pretrained(
             self.model_path,
-            **model_kwargs,
+            local_files_only=True,
+            trust_remote_code=True,
+            dtype=self._resolve_torch_dtype(torch),
         )
-        if normalized_device not in {"", "auto"}:
-            self._model = self._model.to(torch.device(normalized_device))
+        if self._resolved_device != "cpu":
+            self._model = self._model.to(self._resolved_device)
         self._model = self._model.eval()
         self._tokenizer = getattr(self._processor, "tokenizer", None)
+
+    def _configure_visual_token_budget(self) -> None:
+        value = os.environ.get("OPTIZ_QWEN_VISUAL_PIXEL_BUDGET", "").strip()
+        if not value:
+            self._visual_pixel_budget = None
+            return
+        pixel_budget = int(value)
+        if pixel_budget < 16384:
+            raise ValueError("visual pixel budget must be at least 16384 (128x128).")
+        image_processor = getattr(self._processor, "image_processor", None)
+        if image_processor is None:
+            raise RuntimeError("processor does not expose an image_processor for visual budgeting.")
+        image_processor.size = {"shortest_edge": pixel_budget, "longest_edge": pixel_budget}
+        self._visual_pixel_budget = pixel_budget
 
     def _install_transformers_log_filters(self) -> None:
         class _MessageFilter(logging.Filter):
@@ -145,6 +160,46 @@ class VLMModel:
 
     def _load_dummy_backend(self, reason: str) -> None:
         self._dummy_reason = reason
+
+    def _resolve_torch_device(self, torch) -> str:
+        requested = (self.device or "auto").lower()
+        if requested == "auto":
+            return "cuda:0" if torch.cuda.is_available() else "cpu"
+        if requested.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but no CUDA device is available.")
+        return self.device
+
+    def _resolve_torch_dtype(self, torch):
+        if str(self._resolved_device).startswith("cuda"):
+            return torch.float16
+        return torch.float32
+
+    def _build_model_inputs(self, *, image, prompt: str):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        chat_text = self._processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = self._processor(
+            text=[chat_text],
+            images=[image],
+            padding=True,
+            return_tensors="pt",
+        )
+        model_device = getattr(self._model, "device", self._resolved_device)
+        return {
+            key: value.to(model_device) if hasattr(value, "to") else value
+            for key, value in inputs.items()
+        }
 
     def _generate_with_transformers(
         self,
@@ -171,60 +226,85 @@ class VLMModel:
             return_dict=True,
             return_tensors="pt",
         ).to(self._model.device)
-        image_token_count = int((inputs.input_ids == self._processor.image_token_id).sum().item())
-        image_grid_thw = inputs["image_grid_thw"][0].tolist()
-        input_image_size = list(image.size)
         input_len = inputs.input_ids.shape[1]
         streamer = TextIteratorStreamer(
-            self._processor.tokenizer,
+            self._tokenizer,
             skip_prompt=True,
             skip_special_tokens=True,
         )
-        generation_kwargs = {
-            **inputs,
-            "max_new_tokens": generation_config.max_new_tokens,
-            "do_sample": generation_config.temperature > 0,
-            "use_cache": True,
-            "streamer": streamer,
-        }
-        kivi_cache = self._build_kivi_cache_if_enabled()
-        if kivi_cache is not None:
-            generation_kwargs["past_key_values"] = kivi_cache
-        if generation_config.temperature > 0:
-            generation_kwargs["temperature"] = generation_config.temperature
-            generation_kwargs["top_p"] = generation_config.top_p
+        kv_chain, kv_report = self._build_kv_chain_if_enabled()
+        runner = os.environ.get("OPTIZ_QWEN_GENERATION_RUNNER", "generate").strip().lower()
+        if kv_report is not None and kv_report.chain_name == "qserve_fused_kv":
+            from optiz_qwen.kernels import install_qwen35_fused_attention
 
-        output_holder: dict[str, Any] = {}
+            install_qwen35_fused_attention(self._model)
+        use_prefill_decode = generation_config.temperature == 0.0 and runner == "greedy"
+        if use_prefill_decode:
+            if kv_chain is None:
+                from transformers.cache_utils import DynamicCache
 
-        def _run_generate() -> None:
-            try:
-                with torch.no_grad():
-                    output_holder["output_ids"] = self._model.generate(**generation_kwargs)
-            except BaseException as exc:
-                output_holder["error"] = exc
-                streamer.end()
+                kv_chain = DynamicCache(config=self._model.config)
+            start = time.perf_counter()
+            generated_ids, runtime_stats = run_greedy_prefill_decode(
+                self._model,
+                inputs,
+                max_new_tokens=generation_config.max_new_tokens,
+                tokenizer=self._tokenizer,
+                eos_token_id=getattr(self._tokenizer, "eos_token_id", None),
+                kivi_cache=kv_chain,
+            )
+            first_chunk_at = start + runtime_stats.ttft_seconds
+            chunks = []
+            output_ids = torch.cat([inputs.input_ids, generated_ids], dim=-1)
+            end = start + runtime_stats.elapsed_seconds
+        else:
+            generation_kwargs = {
+                **inputs,
+                "max_new_tokens": generation_config.max_new_tokens,
+                "use_cache": True,
+                "streamer": streamer,
+                "do_sample": generation_config.temperature > 0,
+            }
+            if generation_config.temperature > 0:
+                generation_kwargs["temperature"] = generation_config.temperature
+                generation_kwargs["top_p"] = generation_config.top_p
+            if kv_chain is not None:
+                attention_mask = inputs.get("attention_mask")
+                dense_decode_mask = attention_mask is None or bool(torch.all(attention_mask == 1).item())
+                setattr(kv_chain, "_optiz_dense_decode_mask", dense_decode_mask)
+                generation_kwargs["past_key_values"] = kv_chain
 
-        worker = threading.Thread(target=_run_generate, daemon=True)
-        start = time.perf_counter()
-        worker.start()
+            output_holder: dict[str, Any] = {}
 
-        first_chunk_at = None
-        chunks: list[str] = []
-        for chunk in streamer:
-            now = time.perf_counter()
-            if first_chunk_at is None and chunk:
-                first_chunk_at = now
-            chunks.append(chunk)
-        worker.join()
-        if "error" in output_holder:
-            raise RuntimeError("Transformers generation failed inside the worker thread.") from output_holder["error"]
-        end = time.perf_counter()
+            def _run_generate() -> None:
+                try:
+                    with torch.no_grad():
+                        output_holder["output_ids"] = self._model.generate(**generation_kwargs)
+                except BaseException as exc:  # pragma: no cover - exercised in live runtime
+                    output_holder["error"] = exc
+                    streamer.end()
 
-        output_ids = output_holder["output_ids"]
+            worker = threading.Thread(target=_run_generate, daemon=True)
+            start = time.perf_counter()
+            worker.start()
+
+            first_chunk_at = None
+            chunks: list[str] = []
+            for chunk in streamer:
+                now = time.perf_counter()
+                if first_chunk_at is None and chunk:
+                    first_chunk_at = now
+                chunks.append(chunk)
+            worker.join()
+            if "error" in output_holder:
+                raise RuntimeError("Transformers generation failed inside the worker thread.") from output_holder["error"]
+            end = time.perf_counter()
+            output_ids = output_holder["output_ids"]
+            runtime_stats = None
         generated_ids = output_ids[0][input_len:]
         text = "".join(chunks).strip()
         if not text:
-            text = self._processor.tokenizer.decode(
+            text = self._tokenizer.decode(
                 generated_ids,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
@@ -250,6 +330,17 @@ class VLMModel:
                 first_chunk_at = fallback_start
 
         ttft = (first_chunk_at - start) if first_chunk_at is not None else (end - start)
+        cache_runtime = None
+        if kv_report is not None and kv_report.chain_name == "qserve_fused_kv":
+            cache_runtime = {
+                "kernel_calls": int(getattr(kv_chain, "kernel_calls", 0)),
+                "fallback_calls": int(getattr(kv_chain, "fallback_calls", 0)),
+                "active_backend": (
+                    "triton_int4_decode"
+                    if getattr(kv_chain, "kernel_calls", 0) > 0
+                    else "torch_materialize_fallback"
+                ),
+            }
         return GenerationResult(
             text=text,
             token_count=int(generated_ids.shape[0]),
@@ -257,29 +348,56 @@ class VLMModel:
             elapsed_seconds=end - start,
             meta={
                 "backend": "transformers",
-                "input_image_size": input_image_size,
-                "image_grid_thw": image_grid_thw,
-                "image_token_count": image_token_count,
-                "kivi_kv_cache": kivi_cache.report().__dict__ if kivi_cache is not None else None,
+                "generation_runner": "greedy" if use_prefill_decode else "generate",
+                "visual_pixel_budget": getattr(self, "_visual_pixel_budget", None),
+                "kv_chain": kv_report.__dict__ if kv_report is not None else None,
+                "kv_runtime": cache_runtime,
+                "prefill_decode_runtime": runtime_stats.__dict__ if runtime_stats is not None else None,
                 "answer_source": answer_source,
                 "raw_text": raw_text,
                 "choice_fallback": choice_fallback_meta,
             },
         )
 
-    def _build_kivi_cache_if_enabled(self):
-        enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower()
-        if enabled not in {"1", "true", "yes", "on"}:
-            return None
-        from optiz_qwen.compression import KiviConfig, build_qwen35_kivi_cache
+    def _build_kv_chain_if_enabled(self):
+        enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower()
+        chain_name = None
+        if enabled in {"1", "true", "yes", "on"}:
+            chain_name = os.environ.get("OPTIZ_QWEN_KV_CHAIN", "qserve_kv").strip().lower()
+        else:
+            legacy_enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower()
+            if legacy_enabled not in {"1", "true", "yes", "on"}:
+                return None, None
+            chain_name = "legacy_kivi"
 
         kivi_config = KiviConfig(
-            k_bits=int(os.environ.get("OPTIZ_QWEN_KIVI_K_BITS", "2")),
-            v_bits=int(os.environ.get("OPTIZ_QWEN_KIVI_V_BITS", "2")),
-            group_size=int(os.environ.get("OPTIZ_QWEN_KIVI_GROUP_SIZE", "32")),
-            residual_length=int(os.environ.get("OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH", "32")),
+            k_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_K_BITS", os.environ.get("OPTIZ_QWEN_KIVI_K_BITS", "2"))),
+            v_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_V_BITS", os.environ.get("OPTIZ_QWEN_KIVI_V_BITS", "2"))),
+            group_size=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE", os.environ.get("OPTIZ_QWEN_KIVI_GROUP_SIZE", "32"))),
+            residual_length=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH", os.environ.get("OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH", "32"))),
         )
-        return build_qwen35_kivi_cache(self._model.config, kivi_config)
+        qserve_config = None
+        if chain_name in {"qserve_kv", "qserve_fused_kv"}:
+            qserve_config = QServeKvConfig(
+                k_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_K_BITS", "4")),
+                v_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_V_BITS", "4")),
+                group_size=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE", "32")),
+                residual_length=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH", "32")),
+            )
+        kv_chain, kv_report = build_kv_chain(
+            chain_name=chain_name,
+            model_config=self._model.config,
+            enabled=True,
+            kivi_config=kivi_config,
+            qserve_config=qserve_config,
+        )
+        return kv_chain, kv_report
+
+    def _build_kivi_cache_if_enabled(self):
+        kv_chain, kv_report = self._build_kv_chain_if_enabled()
+        if kv_report is None or kv_report.chain_name != "legacy_kivi":
+            return None
+        return kv_chain
 
     def _choice_fallback_enabled(self) -> bool:
         value = os.environ.get("OPTIZ_QWEN_CHOICE_FALLBACK", "1").strip().lower()
@@ -301,20 +419,7 @@ class VLMModel:
             usable_choices = ["A", "B", "C", "D"]
 
         try:
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": f"{prompt.rstrip()}\nAnswer:"},
-                ],
-            }]
-            inputs = self._processor.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-            ).to(self._model.device)
+            inputs = self._build_model_inputs(image=image, prompt=f"{prompt.rstrip()}\nAnswer:")
             with self._torch.no_grad():
                 outputs = self._model(**inputs, use_cache=False)
             logits = outputs.logits[0, -1, :]

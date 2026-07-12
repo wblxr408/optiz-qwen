@@ -1,0 +1,10 @@
+# Local Windows GPU overlay for the `optiz-qwen` conda environment.
+#
+# Decision note:
+# - Option A: force CUDA wheels into the organizer minimum runtime file.
+# - Option B: keep the organizer file generic and add a local Windows GPU overlay.
+# Selected: Option B, because the competition runtime may differ from this
+# workstation, while the local smoke test still needs a reproducible GPU install.
+--index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision

@@ -47,6 +47,8 @@ class KiviAttentionLayer(CacheLayerMixin):
         self._value_scale = None
         self._value_mn = None
         self._value_residual = None
+        self._dense_keys = None
+        self._dense_values = None
 
     def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         self.dtype = key_states.dtype
@@ -66,7 +68,7 @@ class KiviAttentionLayer(CacheLayerMixin):
 
         if key_states.shape[-2] == 1:
             self._append_decode_token(key_states, value_states)
-            return self.materialize()
+            return self._dense_keys, self._dense_values
 
         # Fallback for chunked updates: preserve correctness, but this path is
         # more expensive because the native attention API needs dense tensors.
@@ -82,10 +84,15 @@ class KiviAttentionLayer(CacheLayerMixin):
         if not self.is_initialized or self._seq_length == 0:
             raise ValueError("KIVI cache layer is empty and cannot be materialized.")
 
+        if self._dense_keys is not None and self._dense_values is not None:
+            return self._dense_keys, self._dense_values
+
         keys = self._materialize_keys()
         values = self._materialize_values()
         self.keys = keys
         self.values = values
+        self._dense_keys = keys
+        self._dense_values = values
         return keys, values
 
     def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
@@ -132,6 +139,8 @@ class KiviAttentionLayer(CacheLayerMixin):
         self._value_code = self._value_scale = self._value_mn = self._value_residual = None
         self.keys = None
         self.values = None
+        self._dense_keys = None
+        self._dense_values = None
         self.is_initialized = False
 
     def _rebuild_from_full(self, keys: torch.Tensor, values: torch.Tensor) -> None:
@@ -143,6 +152,8 @@ class KiviAttentionLayer(CacheLayerMixin):
         self._pack_values(values)
         self.keys = None
         self.values = None
+        self._dense_keys = keys
+        self._dense_values = values
 
     def _append_decode_token(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         self.dtype = key_states.dtype
@@ -151,6 +162,12 @@ class KiviAttentionLayer(CacheLayerMixin):
         self._seq_length += int(key_states.shape[-2])
         self._append_keys(key_states)
         self._append_values(value_states)
+        if self._dense_keys is None or self._dense_values is None:
+            self._dense_keys = key_states
+            self._dense_values = value_states
+        else:
+            self._dense_keys = torch.cat([self._dense_keys, key_states], dim=-2).contiguous()
+            self._dense_values = torch.cat([self._dense_values, value_states], dim=-2).contiguous()
         self.keys = None
         self.values = None
 

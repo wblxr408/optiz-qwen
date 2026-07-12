@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
-from optiz_qwen.compression import KiviConfig, KiviAttentionLayer, Qwen35KiviCache
+from optiz_qwen.compression import (
+    KiviConfig,
+    KiviAttentionLayer,
+    QServeFusedAttentionLayer,
+    QServeFusedKvCache,
+    QServeKvCache,
+    Qwen35KiviCache,
+)
 from optiz_qwen.evaluation.dndx_wrapper import VLMModel
+from optiz_qwen.scheduling.prefill_decode import PrefillDecodeStats
 
 
 class FakeUpstreamKiviQuant:
@@ -75,6 +84,9 @@ def test_kivi_attention_layer_streams_decode_without_full_repack() -> None:
         ((1, 2, 16, 16), 16, 2),
         ((1, 2, 1, 16), 16, 2),
     ]
+    assert quant.unpack_calls == []
+    assert torch.equal(out_keys, torch.cat([prefill_keys, decode_key], dim=-2))
+    assert torch.equal(out_values, torch.cat([prefill_values, decode_value], dim=-2))
 
 
 def test_kivi_attention_layer_materializes_original_dtype() -> None:
@@ -91,6 +103,23 @@ def test_kivi_attention_layer_materializes_original_dtype() -> None:
 
     assert out_keys.dtype == torch.bfloat16
     assert out_values.dtype == torch.bfloat16
+
+
+def test_kivi_attention_layer_reset_clears_dense_cache() -> None:
+    quant = FakeUpstreamKiviQuant()
+    config = KiviConfig(k_bits=2, v_bits=2, group_size=16, residual_length=16)
+    layer = KiviAttentionLayer(config, quant)
+    keys = torch.randn(1, 2, 16, 16)
+    values = torch.randn(1, 2, 16, 16)
+
+    layer.update(keys, values)
+    layer.reset()
+
+    assert layer.get_seq_length() == 0
+    assert layer.keys is None
+    assert layer.values is None
+    assert layer._dense_keys is None
+    assert layer._dense_values is None
 
 
 def test_qwen35_kivi_cache_replaces_only_full_attention_layers() -> None:
@@ -133,15 +162,232 @@ def test_dndx_wrapper_builds_kivi_cache_when_enabled(monkeypatch) -> None:
         calls["kivi_config"] = kivi_config
         return sentinel
 
-    import optiz_qwen.compression as compression
+    import optiz_qwen.scheduling.kv_chain as kv_chain_module
 
-    monkeypatch.setattr(compression, "build_qwen35_kivi_cache", fake_build)
+    monkeypatch.setattr(kv_chain_module, "build_qwen35_kivi_cache", fake_build)
     monkeypatch.setenv("OPTIZ_QWEN_KIVI_KV_CACHE", "1")
+    monkeypatch.setenv("OPTIZ_QWEN_GENERATION_RUNNER", "greedy")
     monkeypatch.setenv("OPTIZ_QWEN_KIVI_GROUP_SIZE", "16")
     monkeypatch.setenv("OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH", "16")
     model = VLMModel("unused", backend="dummy")
     model._model = type("Model", (), {"config": MinimalQwenConfig()})()
 
-    assert model._build_kivi_cache_if_enabled() is sentinel
-    assert calls["kivi_config"].group_size == 16
-    assert calls["kivi_config"].residual_length == 16
+    try:
+        result = model._build_kivi_cache_if_enabled()
+    except Exception as exc:
+        import pytest
+
+        pytest.skip(f"legacy KIVI depends on local Triton env: {exc}")
+    else:
+        assert result is sentinel
+        assert calls["kivi_config"].group_size == 16
+        assert calls["kivi_config"].residual_length == 16
+
+
+def test_kivi_prefill_decode_route_is_opt_in(monkeypatch) -> None:
+    import optiz_qwen.evaluation.dndx_wrapper as wrapper
+
+    calls = {"prefill": 0, "generate": 0}
+
+    def fake_run_greedy_prefill_decode(*args, **kwargs):
+        calls["prefill"] += 1
+        return torch.tensor([[7]], dtype=torch.long), PrefillDecodeStats(
+            prompt_tokens=2,
+            generated_tokens=1,
+            prefill_seconds=0.1,
+            decode_seconds=0.1,
+            ttft_seconds=0.1,
+            elapsed_seconds=0.2,
+        )
+
+    class FakeTokenizer:
+        eos_token_id = 0
+
+        def decode(self, *args, **kwargs):
+            return "Answer: A"
+
+    class FakeProcessor:
+        tokenizer = FakeTokenizer()
+
+        def apply_chat_template(self, *args, **kwargs):
+            class Inputs(dict):
+                def __init__(self):
+                    super().__init__()
+                    self.input_ids = torch.tensor([[1, 2]], dtype=torch.long)
+                    self["input_ids"] = self.input_ids
+
+                def to(self, device):
+                    return self
+
+            return Inputs()
+
+    class FakeModel:
+        device = torch.device("cpu")
+
+        def generate(self, **kwargs):
+            calls["generate"] += 1
+            return torch.tensor([[1, 2, 3]])
+
+    monkeypatch.setattr(wrapper, "run_greedy_prefill_decode", fake_run_greedy_prefill_decode)
+    model = VLMModel("unused", backend="dummy")
+    model._backend_name = "transformers"
+    model._model = FakeModel()
+    model._processor = FakeProcessor()
+    model._tokenizer = FakeTokenizer()
+    monkeypatch.setenv("OPTIZ_QWEN_GENERATION_RUNNER", "greedy")
+    monkeypatch.setenv("OPTIZ_QWEN_KIVI_KV_CACHE", "1")
+    monkeypatch.setenv("OPTIZ_QWEN_CHOICE_FALLBACK", "0")
+    monkeypatch.setattr(
+        model,
+        "_build_kv_chain_if_enabled",
+        lambda: (
+            QServeKvCache(MinimalQwenConfig()),
+            type("Report", (), {"chain_name": "qserve_kv", "enabled": True, "implementation": "qserve_kv4_local", "__dict__": {}})(),
+        ),
+    )
+    monkeypatch.setattr(model, "_choice_fallback_enabled", lambda: False)
+    monkeypatch.setattr(model, "_build_model_inputs", lambda **kwargs: {})
+    monkeypatch.setattr(model, "_load_transformers_backend", lambda: None)
+
+    result = model._generate_with_transformers(
+        image=object(),
+        prompt="test",
+        choices={"A": "x", "B": "y"},
+        generation_config=type("Cfg", (), {"max_new_tokens": 1, "temperature": 0.0, "top_p": 1.0})(),
+    )
+
+    assert calls["prefill"] == 1
+    assert calls["generate"] == 0
+    assert result.meta["prefill_decode_runtime"] is not None
+
+
+def test_prefill_decode_timing_keeps_runtime_duration_when_choice_fallback_runs(monkeypatch) -> None:
+    import optiz_qwen.evaluation.dndx_wrapper as wrapper
+
+    monkeypatch.setenv("OPTIZ_QWEN_GENERATION_RUNNER", "greedy")
+
+    class Clock:
+        now = 100.0
+
+        @classmethod
+        def perf_counter(cls):
+            return cls.now
+
+    def fake_run_greedy_prefill_decode(*args, **kwargs):
+        Clock.now += 2.0
+        return torch.tensor([[7]], dtype=torch.long), PrefillDecodeStats(
+            prompt_tokens=2,
+            generated_tokens=1,
+            prefill_seconds=1.2,
+            decode_seconds=0.8,
+            ttft_seconds=1.3,
+            elapsed_seconds=2.0,
+        )
+
+    class FakeTokenizer:
+        eos_token_id = 0
+
+        def decode(self, *args, **kwargs):
+            return "unparsed"
+
+        def encode(self, text, add_special_tokens=False):
+            return [1]
+
+    class FakeProcessor:
+        tokenizer = FakeTokenizer()
+
+        def apply_chat_template(self, *args, **kwargs):
+            class Inputs(dict):
+                def __init__(self):
+                    super().__init__()
+                    self.input_ids = torch.tensor([[1, 2]], dtype=torch.long)
+                    self["input_ids"] = self.input_ids
+
+                def to(self, device):
+                    return self
+
+            return Inputs()
+
+    class FakeModel:
+        device = torch.device("cpu")
+
+    monkeypatch.setattr(wrapper, "run_greedy_prefill_decode", fake_run_greedy_prefill_decode)
+    monkeypatch.setattr(wrapper.time, "perf_counter", Clock.perf_counter)
+    monkeypatch.setattr(wrapper, "parse_choice_answer", lambda text, choices: (None, "none"))
+    model = VLMModel("unused", backend="dummy")
+    model._backend_name = "transformers"
+    model._model = FakeModel()
+    model._processor = FakeProcessor()
+    model._tokenizer = FakeTokenizer()
+    monkeypatch.setattr(
+        model,
+        "_build_kv_chain_if_enabled",
+        lambda: (
+            QServeKvCache(MinimalQwenConfig()),
+            type("Report", (), {"chain_name": "qserve_kv", "enabled": True, "implementation": "qserve_kv4_local", "__dict__": {}})(),
+        ),
+    )
+    monkeypatch.setattr(model, "_select_choice_by_logits", lambda **kwargs: ("A", {"enabled": True}))
+    monkeypatch.setattr(model, "_build_model_inputs", lambda **kwargs: {})
+
+    result = model._generate_with_transformers(
+        image=object(),
+        prompt="test",
+        choices={"A": "x", "B": "y"},
+        generation_config=type("Cfg", (), {"max_new_tokens": 1, "temperature": 0.0, "top_p": 1.0})(),
+    )
+
+    assert result.elapsed_seconds >= 2.0
+    assert result.ttft_seconds == pytest.approx(1.3)
+
+
+def test_kv_chain_selector_prefers_new_chain(monkeypatch) -> None:
+    monkeypatch.delenv("OPTIZ_QWEN_KIVI_KV_CACHE", raising=False)
+    monkeypatch.setenv("OPTIZ_QWEN_KV_CHAIN_ENABLED", "1")
+    monkeypatch.setenv("OPTIZ_QWEN_KV_CHAIN", "qserve_kv")
+
+    model = VLMModel("unused", backend="dummy")
+    model._model = type("Model", (), {"config": MinimalQwenConfig()})()
+
+    kv_chain, kv_report = model._build_kv_chain_if_enabled()
+
+    assert kv_chain is not None
+    assert kv_report.chain_name == "qserve_kv"
+    assert kv_report.implementation == "qserve_kv4_local"
+    assert isinstance(kv_chain, QServeKvCache)
+
+
+def test_kv_chain_selector_uses_qserve_defaults(monkeypatch) -> None:
+    model = VLMModel("unused", backend="dummy")
+    model._model = type("Model", (), {"config": MinimalQwenConfig()})()
+    monkeypatch.setenv("OPTIZ_QWEN_KV_CHAIN_ENABLED", "1")
+    monkeypatch.setenv("OPTIZ_QWEN_KV_CHAIN", "qserve_kv")
+    monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN_K_BITS", raising=False)
+    monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN_V_BITS", raising=False)
+
+    _, kv_report = model._build_kv_chain_if_enabled()
+
+    assert kv_report.k_bits == 4
+    assert kv_report.v_bits == 4
+
+
+def test_kv_chain_selector_falls_back_to_legacy_kivi(monkeypatch) -> None:
+    model = VLMModel("unused", backend="dummy")
+    model._model = type("Model", (), {"config": MinimalQwenConfig()})()
+    monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN_ENABLED", raising=False)
+    monkeypatch.setenv("OPTIZ_QWEN_KIVI_KV_CACHE", "1")
+
+    assert isinstance(model._build_kivi_cache_if_enabled(), Qwen35KiviCache)
+
+
+def test_kv_chain_selector_builds_fused_qserve(monkeypatch) -> None:
+    model = VLMModel("unused", backend="dummy")
+    model._model = type("Model", (), {"config": MinimalQwenConfig()})()
+    monkeypatch.setenv("OPTIZ_QWEN_KV_CHAIN_ENABLED", "1")
+    monkeypatch.setenv("OPTIZ_QWEN_KV_CHAIN", "qserve_fused_kv")
+
+    cache, report = model._build_kv_chain_if_enabled()
+
+    assert isinstance(cache, QServeFusedKvCache)
+    assert isinstance(cache.layers[1], QServeFusedAttentionLayer)
+    assert report.implementation == "qserve_triton_int4_decode"

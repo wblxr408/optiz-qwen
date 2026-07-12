@@ -1,5 +1,11 @@
-# Local development helpers not listed in the organizer's minimal runtime requirements.
+# Local development helpers not listed in the organizer's minimal runtime
+# requirements.
+#
+# Decision note:
+# - Option A: keep all extra tools in the minimum runtime file.
+# - Option B: split organizer runtime from local-only tooling.
+# Selected: Option B, because the competition baseline path should stay lean,
+# while local download/testing helpers can evolve independently.
 modelscope
-torchvision
-accelerate
 matplotlib
+pytest

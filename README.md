@@ -7,7 +7,8 @@ Qwen3.5-2B VLM edge-deployment optimization workspace for the PPU competition tr
 - The project skeleton is in place.
 - The organizer's public DNDX self-test path has been integrated into the evaluation layer.
 - The official final evaluation dataset has not been downloaded yet.
-- Model weights and part of the PPU reference materials have not been downloaded yet.
+- The local ModelScope weights should live under `resources/model_weights/raw/Qwen3.5-2B/` and remain ignored by Git.
+- Part of the PPU reference materials have not been downloaded yet.
 - Optimization modules are intentionally left unimplemented for now.
 
 ## Project layout
@@ -56,12 +57,21 @@ The original `dndx_participant` bundle has been split into the repository layout
 - `resources/eval_dataset/raw/mmbench_public/`: public MMBench TSV files
 - `resources/model_weights/raw/Qwen3.5-2B/`: local model landing path
 - `configs/requirements/dndx_public.txt`: minimum dependency snapshot for this self-test path
+- `configs/requirements/local_dev_extra.txt`: local-only helper packages such as `modelscope`
+- `scripts/download_qwen35_2b_modelscope.py`: cross-platform ModelScope download entrypoint
 
 Local public self-test example:
 
 ```bash
 pip install -r configs/requirements/dndx_public.txt
 python benchmark_public.py --backend dummy --num-samples 4
+```
+
+Local GPU one-sample smoke test after downloading the ModelScope weights:
+
+```bash
+conda run -n optiz-qwen python -m pip install --force-reinstall -r configs/requirements/local_gpu_windows_cuda.txt
+conda run -n optiz-qwen python benchmark_public.py --backend transformers --device cuda --num-samples 1
 ```
 
 KIVI KV-cache experiment example:

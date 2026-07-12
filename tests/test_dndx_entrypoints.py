@@ -11,6 +11,11 @@ from optiz_qwen.evaluation.dndx_public_benchmark import (
     compute_throughput,
     extract_answer,
     kivi_cli_environment,
+    kv_chain_cli_environment,
+    Sample,
+    select_samples,
+    runner_cli_environment,
+    visual_cli_environment,
 )
 
 
@@ -79,3 +84,69 @@ def test_kivi_cli_environment_sets_and_restores_env(monkeypatch) -> None:
     import os
 
     assert "OPTIZ_QWEN_KIVI_KV_CACHE" not in os.environ
+
+
+def test_kv_chain_cli_environment_sets_and_restores_env(monkeypatch) -> None:
+    monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN_ENABLED", raising=False)
+    monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN", raising=False)
+    args = Namespace(
+        enable_kv_chain=True,
+        kv_chain="qserve_kv",
+        kv_chain_k_bits=4,
+        kv_chain_v_bits=4,
+        kv_chain_group_size=32,
+        kv_chain_residual_length=32,
+    )
+
+    with kv_chain_cli_environment(args):
+        import os
+
+        assert os.environ["OPTIZ_QWEN_KV_CHAIN_ENABLED"] == "1"
+        assert os.environ["OPTIZ_QWEN_KV_CHAIN"] == "qserve_kv"
+
+    import os
+
+    assert "OPTIZ_QWEN_KV_CHAIN_ENABLED" not in os.environ
+    assert "OPTIZ_QWEN_KV_CHAIN" not in os.environ
+
+
+def test_runner_and_visual_environments_are_scoped(monkeypatch) -> None:
+    import os
+
+    monkeypatch.delenv("OPTIZ_QWEN_GENERATION_RUNNER", raising=False)
+    monkeypatch.delenv("OPTIZ_QWEN_VISUAL_PIXEL_BUDGET", raising=False)
+    args = Namespace(generation_runner="greedy", visual_pixel_budget=36864)
+
+    with runner_cli_environment(args), visual_cli_environment(args):
+        assert os.environ["OPTIZ_QWEN_GENERATION_RUNNER"] == "greedy"
+        assert os.environ["OPTIZ_QWEN_VISUAL_PIXEL_BUDGET"] == "36864"
+
+    assert "OPTIZ_QWEN_GENERATION_RUNNER" not in os.environ
+    assert "OPTIZ_QWEN_VISUAL_PIXEL_BUDGET" not in os.environ
+
+
+def test_stratified_sample_selection_is_balanced_and_reproducible() -> None:
+    samples = [
+        Sample(str(index), "cn", "q", "", {"A": "a"}, "A", "", category, "sub")
+        for category in ("ocr", "object_localization")
+        for index in range(5)
+    ]
+
+    first = select_samples(
+        samples,
+        limit=6,
+        strategy="stratified",
+        seed=17,
+        categories={"ocr", "object_localization"},
+    )
+    second = select_samples(
+        samples,
+        limit=6,
+        strategy="stratified",
+        seed=17,
+        categories={"ocr", "object_localization"},
+    )
+
+    assert [sample.sample_id for sample in first] == [sample.sample_id for sample in second]
+    assert [sample.category for sample in first].count("ocr") == 3
+    assert [sample.category for sample in first].count("object_localization") == 3
