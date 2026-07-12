@@ -86,6 +86,18 @@ def test_kivi_cli_environment_sets_and_restores_env(monkeypatch) -> None:
     assert "OPTIZ_QWEN_KIVI_KV_CACHE" not in os.environ
 
 
+def test_kivi_cli_environment_disables_inherited_setting(monkeypatch) -> None:
+    monkeypatch.setenv("OPTIZ_QWEN_KIVI_KV_CACHE", "1")
+    args = Namespace(enable_kivi_kv_cache=False)
+
+    with kivi_cli_environment(args):
+        import os
+
+        assert "OPTIZ_QWEN_KIVI_KV_CACHE" not in os.environ
+
+    assert os.environ["OPTIZ_QWEN_KIVI_KV_CACHE"] == "1"
+
+
 def test_kv_chain_cli_environment_sets_and_restores_env(monkeypatch) -> None:
     monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN_ENABLED", raising=False)
     monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN", raising=False)
@@ -108,6 +120,21 @@ def test_kv_chain_cli_environment_sets_and_restores_env(monkeypatch) -> None:
 
     assert "OPTIZ_QWEN_KV_CHAIN_ENABLED" not in os.environ
     assert "OPTIZ_QWEN_KV_CHAIN" not in os.environ
+
+
+def test_kv_chain_cli_environment_disables_inherited_setting(monkeypatch) -> None:
+    monkeypatch.setenv("OPTIZ_QWEN_KV_CHAIN_ENABLED", "1")
+    monkeypatch.setenv("OPTIZ_QWEN_KV_CHAIN", "qserve_kv")
+    args = Namespace(enable_kv_chain=False)
+
+    with kv_chain_cli_environment(args):
+        import os
+
+        assert "OPTIZ_QWEN_KV_CHAIN_ENABLED" not in os.environ
+        assert "OPTIZ_QWEN_KV_CHAIN" not in os.environ
+
+    assert os.environ["OPTIZ_QWEN_KV_CHAIN_ENABLED"] == "1"
+    assert os.environ["OPTIZ_QWEN_KV_CHAIN"] == "qserve_kv"
 
 
 def test_runner_and_visual_environments_are_scoped(monkeypatch) -> None:

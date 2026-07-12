@@ -264,6 +264,9 @@ def kivi_cli_environment(args: argparse.Namespace):
         os.environ["OPTIZ_QWEN_KIVI_V_BITS"] = str(args.kivi_v_bits)
         os.environ["OPTIZ_QWEN_KIVI_GROUP_SIZE"] = str(args.kivi_group_size)
         os.environ["OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH"] = str(args.kivi_residual_length)
+    else:
+        for key in KIVI_ENV_KEYS:
+            os.environ.pop(key, None)
     try:
         yield
     finally:
@@ -284,6 +287,9 @@ def kv_chain_cli_environment(args: argparse.Namespace):
         os.environ["OPTIZ_QWEN_KV_CHAIN_V_BITS"] = str(getattr(args, "kv_chain_v_bits", 4))
         os.environ["OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE"] = str(getattr(args, "kv_chain_group_size", 32))
         os.environ["OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH"] = str(getattr(args, "kv_chain_residual_length", 32))
+    else:
+        for key in KV_CHAIN_ENV_KEYS:
+            os.environ.pop(key, None)
     try:
         yield
     finally:
