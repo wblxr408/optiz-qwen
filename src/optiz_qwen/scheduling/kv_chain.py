@@ -9,6 +9,7 @@ from optiz_qwen.compression import (
     KiviConfig,
     QServeKvConfig,
     build_qwen35_kivi_cache,
+    build_qserve_fused_kv_cache,
     build_qserve_kv_cache,
 )
 from optiz_qwen.scheduling.prefill_decode import PrefillDecodeStats
@@ -67,5 +68,18 @@ def build_kv_chain(
             implementation="qserve_kv4_local",
         )
         return cache, report
+
+    if normalized == "qserve_fused_kv":
+        cfg = qserve_config or QServeKvConfig()
+        cache = build_qserve_fused_kv_cache(model_config, cfg)
+        return cache, KVChainReport(
+            chain_name=normalized,
+            enabled=True,
+            k_bits=cfg.k_bits,
+            v_bits=cfg.v_bits,
+            group_size=cfg.group_size,
+            residual_length=cfg.residual_length,
+            implementation="qserve_triton_int4_decode",
+        )
 
     raise ValueError(f"unsupported KV chain: {chain_name}")

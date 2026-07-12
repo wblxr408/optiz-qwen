@@ -52,10 +52,15 @@ def run_greedy_prefill_decode(
     prefill_inputs["use_cache"] = True
     if kivi_cache is not None:
         prefill_inputs["past_key_values"] = kivi_cache
+        attention_mask = inputs.get("attention_mask")
+        dense_decode_mask = attention_mask is None or bool(torch.all(attention_mask == 1).item())
+        setattr(kivi_cache, "_optiz_dense_decode_mask", dense_decode_mask)
 
+    _synchronize_device(input_ids)
     prefill_start = time.perf_counter()
     with torch.no_grad():
         prefill_outputs = model(**prefill_inputs)
+    _synchronize_device(input_ids)
     prefill_end = time.perf_counter()
 
     past_key_values = getattr(prefill_outputs, "past_key_values", None)
@@ -78,6 +83,13 @@ def run_greedy_prefill_decode(
     decode_start = first_token_at
     attention_mask = inputs.get("attention_mask")
     current_input_ids = next_token.to(device=device, dtype=torch.long).view(1, 1)
+    if attention_mask is not None:
+        # The first decode step consumes the token predicted from the prefill
+        # pass, so its mask must already extend by one position.
+        attention_mask = torch.cat(
+            [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))],
+            dim=-1,
+        )
 
     for _ in range(max_new_tokens - 1):
         decode_kwargs = _build_decode_kwargs(
@@ -113,6 +125,11 @@ def run_greedy_prefill_decode(
     )
 
 
+def _synchronize_device(tensor: torch.Tensor) -> None:
+    if tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
+
+
 def _build_decode_kwargs(
     *,
     model: Any,
@@ -121,12 +138,27 @@ def _build_decode_kwargs(
     attention_mask: torch.Tensor | None,
 ) -> dict[str, Any]:
     prepare = getattr(model, "prepare_inputs_for_generation", None)
+    position_id_prepare = getattr(model, "_prepare_position_ids_for_generation", None)
+    position_ids = None
+    if callable(position_id_prepare):
+        try:
+            position_ids = position_id_prepare(
+                input_ids,
+                {
+                    "input_ids": input_ids,
+                    "past_key_values": past_key_values,
+                    "attention_mask": attention_mask,
+                },
+            )
+        except Exception:
+            position_ids = None
     if callable(prepare):
         try:
             prepared = prepare(
                 input_ids=input_ids,
                 past_key_values=past_key_values,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 use_cache=True,
             )
             if isinstance(prepared, dict):
@@ -140,6 +172,8 @@ def _build_decode_kwargs(
     }
     if attention_mask is not None:
         decode_kwargs["attention_mask"] = attention_mask
+    if position_ids is not None:
+        decode_kwargs["position_ids"] = position_ids
     return decode_kwargs
 
 

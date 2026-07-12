@@ -391,3 +391,51 @@ class QServeKvCache(DynamicCache):
 
 def build_qserve_kv_cache(model_config: Any, qserve_config: QServeKvConfig | None = None) -> QServeKvCache:
     return QServeKvCache(model_config=model_config, qserve_config=qserve_config)
+
+
+class QServeFusedAttentionLayer(QServeAttentionLayer):
+    """Cache layer that keeps decode KV packed for the fused attention path."""
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
+        if self._seq_length == 0:
+            self._rebuild_from_full(key_states, value_states)
+            return key_states, value_states
+        if key_states.shape[-2] == 1:
+            self._append_decode_token(key_states, value_states)
+            return key_states, value_states
+        previous_keys, previous_values = self.materialize()
+        keys = torch.cat([previous_keys, key_states], dim=-2)
+        values = torch.cat([previous_values, value_states], dim=-2)
+        self._rebuild_from_full(keys, values)
+        return keys, values
+
+
+class QServeFusedKvCache(QServeKvCache):
+    """QServe cache whose full-attention decode reads packed KV directly."""
+
+    def __init__(self, model_config: Any, qserve_config: QServeKvConfig | None = None) -> None:
+        super().__init__(model_config=model_config, qserve_config=qserve_config)
+        for layer_idx in self.full_attention_layers:
+            self.layers[layer_idx] = QServeFusedAttentionLayer(self.qserve_config)
+        self.kernel_calls = 0
+        self.fallback_calls = 0
+
+    def __repr__(self) -> str:
+        return f"QServeFusedKvCache({self.report()})"
+
+
+def build_qserve_fused_kv_cache(
+    model_config: Any,
+    qserve_config: QServeKvConfig | None = None,
+) -> QServeFusedKvCache:
+    return QServeFusedKvCache(model_config=model_config, qserve_config=qserve_config)

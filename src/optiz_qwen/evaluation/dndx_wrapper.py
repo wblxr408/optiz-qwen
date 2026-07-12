@@ -114,6 +114,7 @@ class VLMModel:
             local_files_only=True,
             trust_remote_code=True,
         )
+        self._configure_visual_token_budget()
         self._model = AutoModelForMultimodalLM.from_pretrained(
             self.model_path,
             local_files_only=True,
@@ -124,6 +125,20 @@ class VLMModel:
             self._model = self._model.to(self._resolved_device)
         self._model = self._model.eval()
         self._tokenizer = getattr(self._processor, "tokenizer", None)
+
+    def _configure_visual_token_budget(self) -> None:
+        value = os.environ.get("OPTIZ_QWEN_VISUAL_PIXEL_BUDGET", "").strip()
+        if not value:
+            self._visual_pixel_budget = None
+            return
+        pixel_budget = int(value)
+        if pixel_budget < 16384:
+            raise ValueError("visual pixel budget must be at least 16384 (128x128).")
+        image_processor = getattr(self._processor, "image_processor", None)
+        if image_processor is None:
+            raise RuntimeError("processor does not expose an image_processor for visual budgeting.")
+        image_processor.size = {"shortest_edge": pixel_budget, "longest_edge": pixel_budget}
+        self._visual_pixel_budget = pixel_budget
 
     def _install_transformers_log_filters(self) -> None:
         class _MessageFilter(logging.Filter):
@@ -218,8 +233,18 @@ class VLMModel:
             skip_special_tokens=True,
         )
         kv_chain, kv_report = self._build_kv_chain_if_enabled()
-        use_prefill_decode = kv_chain is not None and generation_config.temperature == 0.0
+        runner = os.environ.get("OPTIZ_QWEN_GENERATION_RUNNER", "generate").strip().lower()
+        if kv_report is not None and kv_report.chain_name == "qserve_fused_kv":
+            from optiz_qwen.kernels import install_qwen35_fused_attention
+
+            install_qwen35_fused_attention(self._model)
+        use_prefill_decode = generation_config.temperature == 0.0 and runner == "greedy"
         if use_prefill_decode:
+            if kv_chain is None:
+                from transformers.cache_utils import DynamicCache
+
+                kv_chain = DynamicCache(config=self._model.config)
+            start = time.perf_counter()
             generated_ids, runtime_stats = run_greedy_prefill_decode(
                 self._model,
                 inputs,
@@ -228,7 +253,6 @@ class VLMModel:
                 eos_token_id=getattr(self._tokenizer, "eos_token_id", None),
                 kivi_cache=kv_chain,
             )
-            start = time.perf_counter()
             first_chunk_at = start + runtime_stats.ttft_seconds
             chunks = []
             output_ids = torch.cat([inputs.input_ids, generated_ids], dim=-1)
@@ -244,6 +268,11 @@ class VLMModel:
             if generation_config.temperature > 0:
                 generation_kwargs["temperature"] = generation_config.temperature
                 generation_kwargs["top_p"] = generation_config.top_p
+            if kv_chain is not None:
+                attention_mask = inputs.get("attention_mask")
+                dense_decode_mask = attention_mask is None or bool(torch.all(attention_mask == 1).item())
+                setattr(kv_chain, "_optiz_dense_decode_mask", dense_decode_mask)
+                generation_kwargs["past_key_values"] = kv_chain
 
             output_holder: dict[str, Any] = {}
 
@@ -301,6 +330,17 @@ class VLMModel:
                 first_chunk_at = fallback_start
 
         ttft = (first_chunk_at - start) if first_chunk_at is not None else (end - start)
+        cache_runtime = None
+        if kv_report is not None and kv_report.chain_name == "qserve_fused_kv":
+            cache_runtime = {
+                "kernel_calls": int(getattr(kv_chain, "kernel_calls", 0)),
+                "fallback_calls": int(getattr(kv_chain, "fallback_calls", 0)),
+                "active_backend": (
+                    "triton_int4_decode"
+                    if getattr(kv_chain, "kernel_calls", 0) > 0
+                    else "torch_materialize_fallback"
+                ),
+            }
         return GenerationResult(
             text=text,
             token_count=int(generated_ids.shape[0]),
@@ -308,7 +348,10 @@ class VLMModel:
             elapsed_seconds=end - start,
             meta={
                 "backend": "transformers",
+                "generation_runner": "greedy" if use_prefill_decode else "generate",
+                "visual_pixel_budget": getattr(self, "_visual_pixel_budget", None),
                 "kv_chain": kv_report.__dict__ if kv_report is not None else None,
+                "kv_runtime": cache_runtime,
                 "prefill_decode_runtime": runtime_stats.__dict__ if runtime_stats is not None else None,
                 "answer_source": answer_source,
                 "raw_text": raw_text,
@@ -334,7 +377,7 @@ class VLMModel:
             residual_length=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH", os.environ.get("OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH", "32"))),
         )
         qserve_config = None
-        if chain_name == "qserve_kv":
+        if chain_name in {"qserve_kv", "qserve_fused_kv"}:
             qserve_config = QServeKvConfig(
                 k_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_K_BITS", "4")),
                 v_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_V_BITS", "4")),

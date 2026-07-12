@@ -5,10 +5,17 @@
 #   Transformers main branch for the multimodal auto-loader.
 # Selected: Option B, because the public benchmark path must be able to load
 # `Qwen/Qwen3.5-2B` locally without relying on stale model-class mappings.
+# NumPy note:
+# - Option A: leave NumPy unconstrained and accept resolver drift to `2.x`.
+# - Option B: keep NumPy on `<2` so existing SciPy/scikit-learn wheels used by
+#   the local Windows benchmark environment remain import-compatible.
+# Selected: Option B, because `transformers` main currently pulls code paths
+# that import scikit-learn during generation setup, and the local benchmark
+# runtime still depends on NumPy 1.x-compatible binary wheels.
 torch
 torchvision
 transformers @ git+https://github.com/huggingface/transformers.git@main
 accelerate
 Pillow
-numpy
+numpy<2
 tiktoken

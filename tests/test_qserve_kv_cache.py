@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from optiz_qwen.compression import QServeAttentionLayer, QServeKvCache, QServeKvConfig
+from optiz_qwen.compression import QServeAttentionLayer, QServeFusedAttentionLayer, QServeKvCache, QServeKvConfig
 
 
 class MinimalQwenConfig:
@@ -49,3 +49,22 @@ def test_qserve_cache_only_replaces_full_attention_layers() -> None:
     assert isinstance(cache.layers[1], QServeAttentionLayer)
     assert cache.layers[0].__class__.__name__ != "QServeAttentionLayer"
     assert cache.report().implementation == "qserve_kv4_local"
+
+
+def test_fused_layer_keeps_decode_output_packed_until_attention() -> None:
+    layer = QServeFusedAttentionLayer(
+        QServeKvConfig(k_bits=4, v_bits=4, group_size=16, residual_length=16)
+    )
+    prefill_keys = torch.randn(1, 2, 16, 16)
+    prefill_values = torch.randn_like(prefill_keys)
+    decode_key = torch.randn(1, 2, 1, 16)
+    decode_value = torch.randn_like(decode_key)
+    layer.update(prefill_keys, prefill_values)
+
+    returned_keys, returned_values = layer.update(decode_key, decode_value)
+
+    assert returned_keys.shape[-2] == 1
+    assert returned_values.shape[-2] == 1
+    materialized_keys, materialized_values = layer.materialize()
+    assert materialized_keys.shape[-2] == 17
+    assert materialized_values.shape[-2] == 17

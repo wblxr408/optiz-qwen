@@ -46,3 +46,52 @@ def test_run_greedy_prefill_decode_uses_past_key_values() -> None:
     assert model.calls[0]["use_cache"] is True
     assert model.calls[1]["past_key_values"] == {"step": 3}
     assert model.calls[2]["past_key_values"] == {"step": 1}
+
+
+def test_run_greedy_prefill_decode_extends_attention_mask_before_first_decode() -> None:
+    model = FakeGreedyModel()
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+    }
+
+    run_greedy_prefill_decode(
+        model,
+        inputs,
+        max_new_tokens=2,
+        tokenizer=object(),
+    )
+
+    assert torch.equal(model.calls[1]["attention_mask"], torch.tensor([[1, 1, 1, 1]], dtype=torch.long))
+
+
+class FakePrepareModel(FakeGreedyModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prepared_position_ids = None
+
+    def _prepare_position_ids_for_generation(self, input_ids, model_kwargs):
+        attention_mask = model_kwargs["attention_mask"]
+        return attention_mask.long().cumsum(-1).unsqueeze(0)
+
+    def prepare_inputs_for_generation(self, **kwargs):
+        self.prepared_position_ids = kwargs.get("position_ids")
+        return kwargs
+
+
+def test_run_greedy_prefill_decode_passes_prepared_position_ids_to_decode() -> None:
+    model = FakePrepareModel()
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+    }
+
+    run_greedy_prefill_decode(
+        model,
+        inputs,
+        max_new_tokens=2,
+        tokenizer=object(),
+    )
+
+    assert model.prepared_position_ids is not None
+    assert torch.equal(model.prepared_position_ids, torch.tensor([[[1, 2, 3, 4]]], dtype=torch.long))
