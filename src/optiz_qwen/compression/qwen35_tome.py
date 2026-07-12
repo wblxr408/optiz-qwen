@@ -8,6 +8,8 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
+from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb_vision
 
 from optiz_qwen.compression.tome import merge_single_visual_sample, merge_visual_units
 
@@ -17,6 +19,7 @@ class Qwen35TomeConfig:
     layer: int
     r: int
     unit_size: int = 4
+    proportional_attention: bool = False
 
     def validate(self, depth: int) -> None:
         if not 0 <= self.layer < depth:
@@ -37,6 +40,7 @@ class Qwen35TomeRuntime:
     restored_tokens: int
     merged_units: int
     merge_host_ms: float
+    proportional_attention: bool
 
 
 class _TomeContext:
@@ -100,12 +104,25 @@ class Qwen35TomeBlock(nn.Module):
             raise RuntimeError("ToMe hidden-state and position lengths diverged.")
 
         if self.layer_index != self.context.config.layer:
-            hidden_states = self.block(
-                hidden_states,
-                cu_seqlens=current_cu_seqlens,
-                position_embeddings=current_positions,
-                **kwargs,
-            )
+            if self.context.config.proportional_attention and self.layer_index > self.context.config.layer:
+                token_sizes = self.context.token_sizes
+                if token_sizes is None:
+                    raise RuntimeError("ToMe token sizes were not initialized.")
+                hidden_states = hidden_states + _proportional_attention_forward(
+                    self.block.attn,
+                    self.block.norm1(hidden_states),
+                    token_sizes,
+                    current_cu_seqlens,
+                    current_positions,
+                )
+                hidden_states = hidden_states + self.block.mlp(self.block.norm2(hidden_states))
+            else:
+                hidden_states = self.block(
+                    hidden_states,
+                    cu_seqlens=current_cu_seqlens,
+                    position_embeddings=current_positions,
+                    **kwargs,
+                )
             return self._restore_output_length(hidden_states)
 
         captured_qkv: list[torch.Tensor] = []
@@ -183,6 +200,7 @@ class Qwen35TomeBlock(nn.Module):
             restored_tokens=hidden_states.shape[0],
             merged_units=result.source_unit_indices.numel(),
             merge_host_ms=merge_host_ms,
+            proportional_attention=self.context.config.proportional_attention,
         )
         hidden_states = result.hidden_states
         hidden_states = hidden_states + self.block.mlp(self.block.norm2(hidden_states))
@@ -195,6 +213,66 @@ class Qwen35TomeBlock(nn.Module):
         if restore_indices is None:
             raise RuntimeError("ToMe reached the final visual layer without a restore map.")
         return hidden_states[restore_indices]
+
+
+def _proportional_attention_forward(
+    attention: nn.Module,
+    hidden_states: torch.Tensor,
+    token_sizes: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    if not hasattr(attention, "qkv") or not hasattr(attention, "proj"):
+        raise TypeError("Proportional attention requires Qwen3.5 vision qkv and proj modules.")
+    if token_sizes.shape != (hidden_states.shape[0], 1):
+        raise ValueError("Proportional attention token_sizes must have shape [tokens, 1].")
+
+    token_count = hidden_states.shape[0]
+    qkv = attention.qkv(hidden_states).reshape(token_count, 3, attention.num_heads, -1)
+    query, key, value = qkv.permute(1, 0, 2, 3).unbind(0)
+    query, key = apply_rotary_pos_emb_vision(query, key, *position_embeddings)
+    query = query.transpose(0, 1).unsqueeze(0)
+    key = key.transpose(0, 1).unsqueeze(0)
+    value = value.transpose(0, 1).unsqueeze(0)
+
+    if cu_seqlens.numel() == 2:
+        attention_output = _scaled_dot_product_with_size(query, key, value, token_sizes, attention.scaling)
+    else:
+        boundaries = cu_seqlens.detach().cpu().tolist()
+        outputs = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            outputs.append(
+                _scaled_dot_product_with_size(
+                    query[:, :, start:end],
+                    key[:, :, start:end],
+                    value[:, :, start:end],
+                    token_sizes[start:end],
+                    attention.scaling,
+                )
+            )
+        attention_output = torch.cat(outputs, dim=2)
+
+    attention_output = attention_output.transpose(1, 2).reshape(token_count, -1).contiguous()
+    return attention.proj(attention_output)
+
+
+def _scaled_dot_product_with_size(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    token_sizes: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    size_bias = token_sizes.log().transpose(0, 1).unsqueeze(0).unsqueeze(0)
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=size_bias,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=scale,
+    )
 
 
 def install_qwen35_tome(model: Any, config: Qwen35TomeConfig) -> None:

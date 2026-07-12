@@ -45,6 +45,7 @@ TOME_ENV_KEYS = (
     "OPTIZ_QWEN_TOME_ENABLED",
     "OPTIZ_QWEN_TOME_LAYER",
     "OPTIZ_QWEN_TOME_R",
+    "OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION",
 )
 
 
@@ -102,6 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-tome", action="store_true")
     parser.add_argument("--tome-layer", type=int, default=12)
     parser.add_argument("--tome-r", type=int, default=1)
+    parser.add_argument("--tome-proportional-attention", action="store_true")
     parser.add_argument(
         "--enable-kivi-kv-cache",
         action="store_true",
@@ -345,6 +347,9 @@ def tome_cli_environment(args: argparse.Namespace):
         os.environ["OPTIZ_QWEN_TOME_ENABLED"] = "1"
         os.environ["OPTIZ_QWEN_TOME_LAYER"] = str(getattr(args, "tome_layer", 12))
         os.environ["OPTIZ_QWEN_TOME_R"] = str(getattr(args, "tome_r", 1))
+        os.environ["OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION"] = (
+            "1" if getattr(args, "tome_proportional_attention", False) else "0"
+        )
     else:
         for key in TOME_ENV_KEYS:
             os.environ.pop(key, None)
@@ -492,6 +497,11 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "tome_enabled": bool(getattr(args, "enable_tome", False)),
             "tome_layer": getattr(args, "tome_layer", None) if getattr(args, "enable_tome", False) else None,
             "tome_r": getattr(args, "tome_r", None) if getattr(args, "enable_tome", False) else None,
+            "tome_proportional_attention": (
+                bool(getattr(args, "tome_proportional_attention", False))
+                if getattr(args, "enable_tome", False)
+                else False
+            ),
             "kivi_kv_cache_requested_by_cli": bool(args.enable_kivi_kv_cache),
             "kivi_kv_cache_enabled_by_env": kivi_env_enabled,
             "kv_chain_requested_by_cli": bool(getattr(args, "enable_kv_chain", False)),

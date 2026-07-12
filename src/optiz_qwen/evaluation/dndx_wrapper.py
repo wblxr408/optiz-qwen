@@ -141,6 +141,10 @@ class VLMModel:
         config = Qwen35TomeConfig(
             layer=int(os.environ.get("OPTIZ_QWEN_TOME_LAYER", "12")),
             r=int(os.environ.get("OPTIZ_QWEN_TOME_R", "1")),
+            proportional_attention=os.environ.get(
+                "OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION",
+                "",
+            ).strip().lower() in {"1", "true", "yes", "on"},
         )
         install_qwen35_tome(self._model, config)
         self._tome_config = config

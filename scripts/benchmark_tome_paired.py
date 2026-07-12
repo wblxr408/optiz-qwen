@@ -36,10 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="resources/model_weights/raw/Qwen3.5-2B")
     parser.add_argument("--device", default="mps")
     parser.add_argument("--num-samples", type=int, default=20)
+    parser.add_argument("--sample-offset", type=int, default=0)
     parser.add_argument("--warmup-samples", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--layer", type=int, default=12)
     parser.add_argument("--r", type=int, default=32)
+    parser.add_argument("--proportional-attention", action="store_true")
     parser.add_argument("--output-prefix", type=Path, required=True)
     return parser.parse_args()
 
@@ -91,12 +93,14 @@ def build_payload(mode: str, rows: list[dict], args: argparse.Namespace) -> dict
         "timestamp": datetime.now().isoformat(),
         "dataset_path": str(Path(args.dataset_path).resolve()),
         "sample_count": len(rows),
+        "sample_offset": args.sample_offset,
         "backend": "transformers",
         "optimization": {
             "mode": mode,
             "paired_alternating_order": True,
             "tome_layer": args.layer if mode == "tome" else None,
             "tome_r": args.r if mode == "tome" else None,
+            "tome_proportional_attention": args.proportional_attention if mode == "tome" else False,
         },
         "performance": {
             "avg_ttft_ms": statistics.mean(valid_ttft),
@@ -117,14 +121,22 @@ def build_payload(mode: str, rows: list[dict], args: argparse.Namespace) -> dict
 
 def main() -> None:
     args = parse_args()
-    if args.num_samples <= 0 or args.warmup_samples < 0:
-        raise ValueError("num-samples must be positive and warmup-samples non-negative.")
-    samples = load_mmbench_tsv(Path(args.dataset_path), limit=args.num_samples)
+    if args.num_samples <= 0 or args.warmup_samples < 0 or args.sample_offset < 0:
+        raise ValueError("num-samples must be positive; warmup-samples and sample-offset must be non-negative.")
+    loaded_samples = load_mmbench_tsv(
+        Path(args.dataset_path),
+        limit=args.sample_offset + args.num_samples,
+    )
+    samples = loaded_samples[args.sample_offset : args.sample_offset + args.num_samples]
     if len(samples) != args.num_samples:
         raise ValueError(f"Requested {args.num_samples} samples, found {len(samples)}.")
 
     model = VLMModel(args.model_path, backend="transformers", device=args.device)
-    config = Qwen35TomeConfig(layer=args.layer, r=args.r)
+    config = Qwen35TomeConfig(
+        layer=args.layer,
+        r=args.r,
+        proportional_attention=args.proportional_attention,
+    )
     install_qwen35_tome(model._model, config)
     model._tome_config = config
 

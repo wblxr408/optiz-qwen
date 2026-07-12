@@ -162,11 +162,17 @@ def test_tome_cli_environment_is_explicit_and_scoped(monkeypatch) -> None:
         assert "OPTIZ_QWEN_TOME_ENABLED" not in os.environ
     assert os.environ["OPTIZ_QWEN_TOME_ENABLED"] == "1"
 
-    enabled_args = Namespace(enable_tome=True, tome_layer=8, tome_r=2)
+    enabled_args = Namespace(
+        enable_tome=True,
+        tome_layer=8,
+        tome_r=2,
+        tome_proportional_attention=True,
+    )
     with tome_cli_environment(enabled_args):
         assert os.environ["OPTIZ_QWEN_TOME_ENABLED"] == "1"
         assert os.environ["OPTIZ_QWEN_TOME_LAYER"] == "8"
         assert os.environ["OPTIZ_QWEN_TOME_R"] == "2"
+        assert os.environ["OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION"] == "1"
 
 
 def test_stratified_sample_selection_is_balanced_and_reproducible() -> None:

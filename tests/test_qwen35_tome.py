@@ -6,6 +6,7 @@ from torch import nn
 
 from optiz_qwen.compression.qwen35_tome import (
     Qwen35TomeConfig,
+    _proportional_attention_forward,
     get_qwen35_tome_runtime,
     install_qwen35_tome,
     set_qwen35_tome_enabled,
@@ -56,6 +57,17 @@ class FakeModel(nn.Module):
         super().__init__()
         self.model = nn.Module()
         self.model.visual = FakeVisual()
+
+
+class FakeProportionalAttention(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.num_heads = 1
+        self.scaling = 2**-0.5
+        self.qkv = nn.Linear(2, 6, bias=False)
+        self.proj = nn.Identity()
+        nn.init.zeros_(self.qkv.weight)
+        nn.init.eye_(self.qkv.weight[4:])
 
 
 def test_single_layer_adapter_updates_following_layer_context() -> None:
@@ -111,6 +123,24 @@ def test_installed_adapter_can_be_disabled_for_paired_measurement() -> None:
     assert hidden_states.shape == (8, 2)
     assert get_qwen35_tome_runtime(model) is None
     assert model.model.visual.blocks[1].block.attn.seen_lengths == [8]
+
+
+def test_proportional_attention_weights_values_by_token_size() -> None:
+    attention = FakeProportionalAttention()
+    hidden_states = torch.tensor([[0.0, 0.0], [4.0, 0.0]])
+    token_sizes = torch.tensor([[1.0], [3.0]])
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    positions = (torch.ones(2, 2), torch.zeros(2, 2))
+
+    output = _proportional_attention_forward(
+        attention,
+        hidden_states,
+        token_sizes,
+        cu_seqlens,
+        positions,
+    )
+
+    assert torch.allclose(output, torch.tensor([[3.0, 0.0], [3.0, 0.0]]))
 
 
 @pytest.mark.parametrize(

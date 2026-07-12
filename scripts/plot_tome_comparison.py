@@ -137,7 +137,18 @@ def main() -> None:
         axis.set_xticks(list(x), question_ids, rotation=45, ha="right", fontsize=8)
         axis.set_xlabel("question_id")
 
-    fig.suptitle("Qwen3.5-2B ToMe L12 R32, MMBench EN20 on MPS", fontsize=14)
+    sample_offset = int(baseline.get("sample_offset", 0))
+    offset_label = f", offset {sample_offset}" if sample_offset else ""
+    dataset_name = "CN" if "_cn" in str(baseline.get("dataset_path", "")).lower() else "EN"
+    optimization = candidate.get("optimization", {})
+    layer = optimization.get("tome_layer", 12)
+    r = optimization.get("tome_r", 32)
+    proportional = " + proportional" if optimization.get("tome_proportional_attention") else ""
+    fig.suptitle(
+        f"Qwen3.5-2B ToMe L{layer} R{r}{proportional}, "
+        f"MMBench {dataset_name}{len(question_ids)}{offset_label} on MPS",
+        fontsize=14,
+    )
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=180, facecolor="white")
