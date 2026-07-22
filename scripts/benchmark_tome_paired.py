@@ -16,6 +16,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from optiz_qwen.compression import Qwen35TomeConfig, install_qwen35_tome, set_qwen35_tome_enabled
 from optiz_qwen.evaluation.answer_parsing import parse_choice_answer
 from optiz_qwen.evaluation.dndx_public_benchmark import (
+    OFFICIAL_MAX_NEW_TOKENS,
     build_prompt,
     compute_throughput,
     decode_image,
@@ -38,7 +39,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=20)
     parser.add_argument("--sample-offset", type=int, default=0)
     parser.add_argument("--warmup-samples", type=int, default=2)
-    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=OFFICIAL_MAX_NEW_TOKENS,
+    )
     parser.add_argument("--layer", type=int, default=12)
     parser.add_argument("--r", type=int, default=32)
     parser.add_argument("--proportional-attention", action="store_true")
@@ -89,12 +94,13 @@ def build_payload(mode: str, rows: list[dict], args: argparse.Namespace) -> dict
     correct = sum(bool(row["correct"]) for row in rows)
     invalid = sum(bool(row["validation_errors"]) for row in rows)
     return {
-        "benchmark_version": "tome_paired_v1",
+        "benchmark_version": "tome_paired_v2_dndx_v1.1",
         "timestamp": datetime.now().isoformat(),
         "dataset_path": str(Path(args.dataset_path).resolve()),
         "sample_count": len(rows),
         "sample_offset": args.sample_offset,
         "backend": "transformers",
+        "generation": {"max_new_tokens": args.max_new_tokens},
         "optimization": {
             "mode": mode,
             "paired_alternating_order": True,

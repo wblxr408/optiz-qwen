@@ -5,19 +5,22 @@ from __future__ import annotations
 import re
 
 
-ANSWER_RE = re.compile(
-    r"""
-    (?:
-        (?:final\s+answer|correct\s+answer|answer|option|choice|答案|正确答案|选项|选择)
-        \s*(?:is|为|是|[:：])?\s*[\(\[（【]?\s*([ABCD])
-    )
-    |
-    (?:
-        ^\s*[\(\[（【]?\s*([ABCD])\s*[\)\]）】]?[\s\.\):：、。]|^\s*([ABCD])\s*$
-    )
-    """,
-    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
-)
+ANSWER_PATTERNS = [
+    re.compile(
+        r"(?:final\s*)?(?:answer|choice|option|答案|选项|选择|正确答案|最终答案)"
+        r"\s*(?:(?:is|为|是|[:：])\s*)*[\(\[（【]?\s*([ABCD])\s*[\)\]）】]?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:我(?:会)?选|我认为(?:是)?|应(?:该)?选|请选择|选|答案为|答案是)"
+        r"\s*(?:[:：]\s*)?[\(\[（【]?\s*([ABCD])\s*[\)\]）】]?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*[\(\[（【]?\s*([ABCD])\s*[\)\]）】]?\s*(?:[\.。,:：\)\]）】\s]|$)",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+]
 
 
 def extract_answer(text: str) -> str | None:
@@ -25,44 +28,16 @@ def extract_answer(text: str) -> str | None:
 
     if not text:
         return None
-    match = ANSWER_RE.search(text)
-    if not match:
-        return None
-    for group in match.groups():
-        if group:
-            return group.upper()
+    for pattern in ANSWER_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(1).upper()
     return None
 
 
-def infer_answer_from_choice_text(text: str, choices: dict[str, str]) -> str | None:
-    """Infer a choice when the model repeats exactly one option text."""
+def parse_choice_answer(text: str, _choices: dict[str, str]) -> tuple[str | None, str]:
+    """Parse a benchmark answer using the official DNDX v1.1 rules."""
 
-    if not text:
-        return None
-    normalized_text = _normalize_for_match(text)
-    matched: list[str] = []
-    for key, value in choices.items():
-        if key not in {"A", "B", "C", "D"} or not value.strip():
-            continue
-        normalized_choice = _normalize_for_match(value)
-        if len(normalized_choice) < 4:
-            continue
-        if normalized_choice in normalized_text:
-            matched.append(key)
-    return matched[0] if len(set(matched)) == 1 else None
-
-
-def parse_choice_answer(text: str, choices: dict[str, str]) -> tuple[str | None, str]:
-    """Parse a benchmark answer and return the extraction source."""
-
-    direct = extract_answer(text)
-    if direct is not None:
-        return direct, "explicit_choice_marker"
-    inferred = infer_answer_from_choice_text(text, choices)
-    if inferred is not None:
-        return inferred, "exact_choice_text"
-    return None, "missing_choice_answer"
-
-
-def _normalize_for_match(text: str) -> str:
-    return re.sub(r"\s+", "", text).strip().lower()
+    answer = extract_answer(text)
+    source = "official_v1.1_pattern" if answer is not None else "missing_choice_answer"
+    return answer, source

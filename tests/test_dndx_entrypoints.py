@@ -8,8 +8,10 @@ from optiz_qwen.evaluation.dndx_public_benchmark import (
     DEFAULT_DATASET_PATH,
     DEFAULT_MODEL_PATH,
     DEFAULT_OUTPUT_PATH,
+    OFFICIAL_MAX_NEW_TOKENS,
     compute_throughput,
     extract_answer,
+    fixed_generation_config,
     kivi_cli_environment,
     kv_chain_cli_environment,
     Sample,
@@ -40,11 +42,14 @@ def test_answer_extraction_and_metrics() -> None:
     assert extract_answer("Answer: B") == "B"
     assert extract_answer("答案：C") == "C"
     assert extract_answer("正确答案是（D）。") == "D"
+    assert extract_answer("我选 A") == "A"
+    assert extract_answer("应该选【B】") == "B"
+    assert extract_answer("Final choice is (C)") == "C"
     assert extract_answer("no valid answer") is None
     assert round(compute_throughput(5, 0.2, 1.0), 3) == 5.0
 
 
-def test_choice_text_answer_inference() -> None:
+def test_choice_text_is_not_inferred_outside_official_rules() -> None:
     answer, source = parse_choice_answer(
         "这项实验能回答：当麦德琳的雪板上有一层蜡或没有蜡时，它是否能在较短的时间内滑下山坡？",
         {
@@ -55,14 +60,16 @@ def test_choice_text_answer_inference() -> None:
         },
     )
 
-    assert answer == "B"
-    assert source == "exact_choice_text"
+    assert answer is None
+    assert source == "missing_choice_answer"
 
 
 def test_default_paths_match_repo_layout() -> None:
     assert DEFAULT_DATASET_PATH == "./resources/eval_dataset/raw/mmbench_public/mmbench_dev_en.tsv"
     assert DEFAULT_MODEL_PATH == "./resources/model_weights/raw/Qwen3.5-2B"
     assert DEFAULT_OUTPUT_PATH == "./benchmarks/output/result_public.json"
+    assert OFFICIAL_MAX_NEW_TOKENS == 256
+    assert fixed_generation_config().max_new_tokens == 256
 
 
 def test_kivi_cli_environment_sets_and_restores_env(monkeypatch) -> None:

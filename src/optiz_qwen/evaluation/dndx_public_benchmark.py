@@ -24,6 +24,7 @@ from .dndx_wrapper import GenerationConfig, VLMModel
 DEFAULT_DATASET_PATH = "./resources/eval_dataset/raw/mmbench_public/mmbench_dev_en.tsv"
 DEFAULT_MODEL_PATH = "./resources/model_weights/raw/Qwen3.5-2B"
 DEFAULT_OUTPUT_PATH = "./benchmarks/output/result_public.json"
+OFFICIAL_MAX_NEW_TOKENS = 256
 KIVI_ENV_KEYS = (
     "OPTIZ_QWEN_KIVI_KV_CACHE",
     "OPTIZ_QWEN_KIVI_K_BITS",
@@ -92,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--warmup-samples", type=int, default=2)
-    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--max-new-tokens", type=int, default=OFFICIAL_MAX_NEW_TOKENS)
     parser.add_argument(
         "--generation-runner",
         choices=["generate", "greedy"],
@@ -214,7 +215,9 @@ def build_prompt(sample: Sample) -> str:
     )
 
 
-def fixed_generation_config(max_new_tokens: int = 64) -> GenerationConfig:
+def fixed_generation_config(
+    max_new_tokens: int = OFFICIAL_MAX_NEW_TOKENS,
+) -> GenerationConfig:
     return GenerationConfig(max_new_tokens=max_new_tokens, temperature=0.0, top_p=1.0)
 
 
@@ -475,7 +478,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     elapsed = time.perf_counter() - benchmark_start
     payload = {
-        "benchmark_version": "dndx_public_self_test",
+        "benchmark_version": "dndx_public_self_test_v1.1",
         "timestamp": datetime.now().isoformat(),
         "dataset_path": str(dataset_path),
         "sample_count": len(samples),
@@ -486,6 +489,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "source_sample_count": len(all_samples),
         },
         "backend": model.backend_name,
+        "generation": {"max_new_tokens": args.max_new_tokens},
         "optimization": {
             "generation_runner": getattr(args, "generation_runner", "generate"),
             "visual_pixel_budget": getattr(args, "visual_pixel_budget", None),
