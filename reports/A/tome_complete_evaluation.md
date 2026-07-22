@@ -1,6 +1,8 @@
 # Qwen3.5-2B ToMe 完整评估报告
 
-日期：2026-07-13
+初版日期：2026-07-13
+
+官方 v1.1 复测：2026-07-22
 
 ## 摘要
 
@@ -22,11 +24,20 @@ r = 32 个 2x2 merge unit
 | 合计正确数 | 121/150 | 122/150 | +1 |
 | 答案变化 | - | 7/150 | 4.67% |
 | 回归 / 修复 | - | 3 / 4 | 净 +1 |
-| 加权平均 TTFT | 约 2080.22 ms | 约 2027.41 ms | **-52.81 ms / -2.54%** |
-| 推理 elapsed 合计 | 约 788.92 s | 约 773.34 s | **-15.58 s / -1.98%** |
-| 总生成 Token 变化 | - | -28 | elapsed 受输出长度影响 |
+| 平均 TTFT | 946.75 ms | 926.98 ms | **-19.76 ms / -2.09%** |
+| 平均 Decode 吞吐 | 13.437 tok/s | 13.557 tok/s | **+0.89%** |
+| 推理 elapsed 合计 | 448.38 s | 455.58 s | **+7.20 s / +1.60%** |
+| 总生成 Token | 3362 | 3437 | +75 |
+| Logits 回退触发 | 5 | 6 | +1 |
 
-结论：最终候选在三组数据上均获得正向 TTFT，合计准确率没有下降；但约 4.67% 的题目答案发生变化，因此它是一个有风险的速度优化候选，不是严格逐题无损方案。
+结论：最终候选在三组数据上均获得正向 TTFT，合计准确率没有下降；
+但约 4.67% 的题目答案发生变化，而且生成长度差异使端到端总耗时反而增加。
+因此它证明了视觉 prefill 可以加速，但尚未证明完整任务更快，也不是严格逐题无损方案。
+
+> [!IMPORTANT]
+> 本摘要与“最终候选”章节使用官方 DNDX v1.1 协议：官方答案解析规则、
+> `max_new_tokens=256`。后文参数筛选保留 v1.1 发布前的 64-token 历史实验，
+> 仅用于解释配置选择，不能与新版绝对耗时直接横向比较。
 
 ## 研究背景
 
@@ -121,7 +132,9 @@ EN5、320 Patch Token、L12R32 同步剖析：
 - 模型：本地 Qwen3.5-2B，BF16；
 - 设备：Apple Silicon MPS；
 - 数据：MMBench dev EN/CN；
-- 生成上限：64 Token；
+- 评测协议：官方 DNDX participant v1.1；
+- 答案解析：官方 v1.1 三组正则，不使用选项文本反推；
+- 生成上限：256 Token；
 - 每轮预热：2 个样本；
 - 比较方式：同一模型安装 ToMe 后，通过显式开关交替运行 baseline 与 candidate；
 - 顺序控制：奇数题 candidate 先运行，偶数题 baseline 先运行；
@@ -129,7 +142,14 @@ EN5、320 Patch Token、L12R32 同步剖析：
 
 paired baseline 同样经过空 ToMe wrapper，适合估计 ToMe 净增量；它不替代赛事官方绝对 baseline。
 
+`evaluation_wrapper.py` 内已有的 logits 选项回退属于模型内部推理策略，并未修改
+benchmark 评分器。本次 EN100 未触发该路径；CN50 baseline 触发 5 次、ToMe
+触发 6 次。报告分别披露触发次数，因为二次 forward 会影响端到端耗时。
+
 ## 参数筛选
+
+本节为官方 v1.1 发布前的历史筛选，统一使用 64-token 本地协议。其用途是选择
+`L16R32 + proportional attention`，不作为最终准确率与完整耗时结论。
 
 ### 无 Proportional Attention
 
@@ -180,12 +200,13 @@ paired baseline 同样经过空 ToMe wrapper，适合估计 ToMe 净增量；它
 |---|---:|---:|---:|
 | 正确率 | 37/50 | 39/50 | +2 |
 | 答案变化 | - | 2 | 均为修复 |
-| 平均 TTFT | 2195.93 ms | 2134.83 ms | **-2.78%** |
-| Decode 吞吐 | 8.488 | 8.590 tok/s | +1.20% |
-| Elapsed 合计 | 175.49 s | 169.88 s | -3.20% |
+| 平均 TTFT | 995.28 ms | 983.84 ms | **-1.15%** |
+| Decode 吞吐 | 14.126 | 14.131 tok/s | +0.04% |
+| Elapsed 合计 | 89.25 s | 88.33 s | -1.03% |
 | Token 差 | - | -5 | Candidate 较短 |
+| Logits 回退 | 0 | 0 | 未触发 |
 
-![L16R32 proportional EN50](images/tome_prop_l16_r32_en50_64tok_paired_mps.png)
+![L16R32 proportional EN50, DNDX v1.1](images/tome_prop_l16_r32_en50_v11_256tok_paired_mps.png)
 
 ### EN50 第 51-100 题
 
@@ -193,18 +214,22 @@ paired baseline 同样经过空 ToMe wrapper，适合估计 ToMe 净增量；它
 |---|---:|---:|---:|
 | 正确率 | 41/50 | 40/50 | -1 |
 | 答案变化 | - | 3 | 2 回归、1 修复 |
-| 平均 TTFT | 2072.99 ms | 2010.51 ms | **-3.01%** |
-| Decode 吞吐 | 9.736 | 9.906 tok/s | +1.75% |
-| Elapsed 合计 | 151.38 s | 145.70 s | -3.75% |
+| 平均 TTFT | 923.59 ms | 901.58 ms | **-2.38%** |
+| Decode 吞吐 | 16.110 | 16.384 tok/s | +1.70% |
+| Elapsed 合计 | 74.51 s | 71.93 s | -3.47% |
 | Token 差 | - | -14 | Candidate 较短 |
+| Logits 回退 | 0 | 0 | 未触发 |
 
-![L16R32 proportional EN50 offset 50](images/tome_prop_l16_r32_en50_offset50_64tok_paired_mps.png)
+![L16R32 proportional EN50 offset 50, DNDX v1.1](images/tome_prop_l16_r32_en50_offset50_v11_256tok_paired_mps.png)
 
 EN100 合计：
 
 - 正确率：78→79；
 - 答案变化：5/100，2 回归、3 修复；
-- TTFT 两组分别快 2.78% 与 3.01%，加权约快 2.90%。
+- 平均 TTFT：959.44→942.71 ms，约快 1.74%；
+- 平均 decode 吞吐：15.118→15.257 tok/s，约提升 0.92%；
+- elapsed 合计：163.77→160.26 s，减少 3.50 s；
+- 生成 Token：988→969，减少 19，因此 elapsed 不能完全归因于 ToMe。
 
 ### CN50
 
@@ -212,14 +237,19 @@ EN100 合计：
 |---|---:|---:|---:|
 | 正确率 | 43/50 | 43/50 | 0 |
 | 答案变化 | - | 2 | 1 回归、1 修复 |
-| 平均 TTFT | 1971.72 ms | 1936.88 ms | **-1.77%** |
-| Decode 吞吐 | 6.063 | 6.030 tok/s | -0.54% |
-| Elapsed 合计 | 462.06 s | 457.76 s | -0.93% |
-| Token 差 | - | -9 | Candidate 较短 |
+| 平均 TTFT | 921.38 ms | 895.53 ms | **-2.81%** |
+| Decode 吞吐 | 10.075 | 10.157 tok/s | +0.81% |
+| Elapsed 合计 | 284.62 s | 295.31 s | **+3.76%** |
+| 生成 Token | 2374 | 2468 | +94 |
+| 超过 64 Token | 8 | 5 | 旧协议会截断 |
+| 达到 256 Token | 0 | 1 | Candidate 样本 313 |
+| Logits 回退 | 5 | 6 | Candidate 多 1 次 |
 
-![L16R32 proportional CN50](images/tome_prop_l16_r32_cn50_64tok_paired_mps.png)
+![L16R32 proportional CN50, DNDX v1.1](images/tome_prop_l16_r32_cn50_v11_256tok_paired_mps.png)
 
-中文上 TTFT 收益仍为正向，准确率没有净下降。
+中文上 TTFT 收益仍为正向，准确率没有净下降；但 Candidate 多生成 94 Token，
+并在样本 313 达到 256 Token 上限、触发额外 logits forward，最终使端到端耗时
+增加 10.70 秒。这证明 TTFT 改善真实存在，也证明它不足以单独保证完整运行更快。
 
 ## 汇总结论
 
@@ -228,14 +258,14 @@ EN100 合计：
 1. ToMe 核心算子在 MPS 上约为 2.5-3.4 ms，并非主要瓶颈。
 2. 视觉序列缩短能真实加速后续视觉层。
 3. 完整视觉模型在同步剖析中约快 6%。
-4. Proportional attention 的 TTFT 收益在两组 EN50 和一组 CN50 上均为正向。
+4. 官方 v1.1 复测中，Proportional attention 的 TTFT 收益在两组 EN50 和一组 CN50 上均为正向。
 5. L16R32 比 L12R32 更稳健：EN100 答案变化率从 7% 降至 5%，准确率从净 -1 提升为净 +1。
-6. 最终候选在 EN100+CN50 合计正确率净 +1，TTFT 加权约快 2.54%。
+6. 最终候选在 EN100+CN50 合计正确率净 +1，平均 TTFT 约快 2.09%，平均 decode 吞吐约提升 0.89%。
 
 ### 未证明
 
 1. 不能声明逐题无损：150 题中有 7 题变化。
-2. 不能声明 decode 吞吐优化：语言模型输入长度最终恢复，吞吐差异容易受热状态与输出长度影响。
+2. 不能声明端到端加速：Candidate 多生成 75 Token，150 条合计 elapsed 反而增加 1.60%。
 3. 不能用不同轮次的绝对时间横向比较：长时间 MPS 满载会明显降频。
 4. 尚未在赛事 PPU、CUDA 服务器或官方隐藏测试集上验证。
 5. 自定义 proportional SDPA 路径的目标硬件兼容性仍需验证。
@@ -258,13 +288,16 @@ EN100 合计：
 3. SDPA additive bias 的后端支持；
 4. 至少两次独立 paired 重复。
 
-若目标硬件 TTFT 仍提升约 2-3%，且准确率不下降，则 L16R32 proportional 可以进入最终组合优化；否则应作为有损实验分支保留。
+若目标硬件 TTFT 仍提升约 2%，准确率不下降，且在固定输出或重复运行下端到端
+耗时也获得稳定改善，则 L16R32 proportional 可以进入最终组合优化；否则应作为
+有损实验分支保留。
 
 ## 工程状态
 
 - ToMe 默认关闭；
 - proportional attention 默认关闭；
 - 公共 benchmark 参数显式记录配置；
+- 公共 benchmark 默认使用官方 v1.1 的 256 Token 上限与答案解析规则；
 - paired benchmark 支持样本 offset；
 - 单元测试覆盖 matching、size-weighted merge、packed 边界、MPS 一致性、运行开关和 proportional-attention 数学性质；
 - 没有引入 Triton、CUDA 或外部 ToMe 包。

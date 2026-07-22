@@ -81,10 +81,11 @@ def main() -> None:
     status_ax.set_yticks([])
     status_ax.set_title(
         f"Answer status: baseline {baseline['accuracy']['correct']}/{len(question_ids)}, "
-        f"ToMe {candidate['accuracy']['correct']}/{len(question_ids)}"
+        f"ToMe {candidate['accuracy']['correct']}/{len(question_ids)}",
+        pad=10,
     )
     status_ax.spines[["left", "right", "top"]].set_visible(False)
-    status_ax.legend(
+    fig.legend(
         handles=[
             mpatches.Patch(color="#4C78A8", label="both correct"),
             mpatches.Patch(color="#F58518", label="both wrong"),
@@ -94,7 +95,7 @@ def main() -> None:
         ncol=4,
         frameon=False,
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.45),
+        bbox_to_anchor=(0.5, 0.965),
     )
 
     ttft_ax.bar(x, deltas, color=delta_colors, width=0.75)
@@ -148,8 +149,9 @@ def main() -> None:
         f"Qwen3.5-2B ToMe L{layer} R{r}{proportional}, "
         f"MMBench {dataset_name}{len(question_ids)}{offset_label} on MPS",
         fontsize=14,
+        y=0.995,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=180, facecolor="white")
     plt.close(fig)
