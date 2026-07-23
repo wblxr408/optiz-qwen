@@ -74,3 +74,17 @@ def test_gdn_environment_does_not_leak_into_baseline(tmp_path: Path) -> None:
 
     assert baseline_env["PYTHONPATH"] == str((code_root / "src").resolve())
     assert fast_env["PYTHONPATH"].split(MODULE.os.pathsep)[0] == str(overlay.resolve())
+
+
+def test_python_launcher_symlink_is_preserved(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "base-python"
+    launcher = tmp_path / "venv-python"
+    target.write_text("", encoding="utf-8")
+    try:
+        launcher.symlink_to(target)
+    except OSError:
+        return
+
+    assert MODULE.executable_path(launcher) == launcher.absolute()
+    assert MODULE.executable_path(launcher) != launcher.resolve()

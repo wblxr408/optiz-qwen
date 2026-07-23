@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-RUNNER_VERSION = "RERUN-v0.1"
+RUNNER_VERSION = "RERUN-v0.1.1"
 EXPECTED_BENCHMARK_VERSION = "dndx_public_self_test_v1.1"
 
 
@@ -70,6 +70,11 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def executable_path(path: Path) -> Path:
+    # Resolving a venv launcher symlink can bypass pyvenv.cfg and load another environment.
+    return Path(os.path.abspath(path.expanduser()))
 
 
 def model_identity(path: Path) -> dict[str, Any]:
@@ -269,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
 
     code_root = args.code_root.resolve()
     output_root = args.output_root.resolve()
-    python = args.python.resolve()
+    python = executable_path(args.python)
     dataset_path = args.dataset_path.resolve()
     cases = resolve_cases(args)
     for path in [code_root, dataset_path, python, *(spec.model_path for spec in cases)]:
