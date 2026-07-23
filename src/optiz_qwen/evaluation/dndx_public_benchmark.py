@@ -24,6 +24,7 @@ from .dndx_wrapper import GenerationConfig, VLMModel
 DEFAULT_DATASET_PATH = "./resources/eval_dataset/raw/mmbench_public/mmbench_dev_en.tsv"
 DEFAULT_MODEL_PATH = "./resources/model_weights/raw/Qwen3.5-2B"
 DEFAULT_OUTPUT_PATH = "./benchmarks/output/result_public.json"
+OFFICIAL_MAX_NEW_TOKENS = 256
 KIVI_ENV_KEYS = (
     "OPTIZ_QWEN_KIVI_KV_CACHE",
     "OPTIZ_QWEN_KIVI_K_BITS",
@@ -41,6 +42,12 @@ KV_CHAIN_ENV_KEYS = (
 )
 RUNNER_ENV_KEYS = ("OPTIZ_QWEN_GENERATION_RUNNER",)
 VISUAL_ENV_KEYS = ("OPTIZ_QWEN_VISUAL_PIXEL_BUDGET",)
+TOME_ENV_KEYS = (
+    "OPTIZ_QWEN_TOME_ENABLED",
+    "OPTIZ_QWEN_TOME_LAYER",
+    "OPTIZ_QWEN_TOME_R",
+    "OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION",
+)
 
 
 @dataclass
@@ -86,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--warmup-samples", type=int, default=2)
-    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--max-new-tokens", type=int, default=OFFICIAL_MAX_NEW_TOKENS)
     parser.add_argument(
         "--generation-runner",
         choices=["generate", "greedy"],
@@ -94,6 +101,10 @@ def parse_args() -> argparse.Namespace:
         help="Use greedy for a runner-identical baseline versus KV-chain comparison.",
     )
     parser.add_argument("--visual-pixel-budget", type=int, default=None)
+    parser.add_argument("--enable-tome", action="store_true")
+    parser.add_argument("--tome-layer", type=int, default=12)
+    parser.add_argument("--tome-r", type=int, default=1)
+    parser.add_argument("--tome-proportional-attention", action="store_true")
     parser.add_argument(
         "--enable-kivi-kv-cache",
         action="store_true",
@@ -204,7 +215,9 @@ def build_prompt(sample: Sample) -> str:
     )
 
 
-def fixed_generation_config(max_new_tokens: int = 64) -> GenerationConfig:
+def fixed_generation_config(
+    max_new_tokens: int = OFFICIAL_MAX_NEW_TOKENS,
+) -> GenerationConfig:
     return GenerationConfig(max_new_tokens=max_new_tokens, temperature=0.0, top_p=1.0)
 
 
@@ -264,6 +277,9 @@ def kivi_cli_environment(args: argparse.Namespace):
         os.environ["OPTIZ_QWEN_KIVI_V_BITS"] = str(args.kivi_v_bits)
         os.environ["OPTIZ_QWEN_KIVI_GROUP_SIZE"] = str(args.kivi_group_size)
         os.environ["OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH"] = str(args.kivi_residual_length)
+    else:
+        for key in KIVI_ENV_KEYS:
+            os.environ.pop(key, None)
     try:
         yield
     finally:
@@ -284,6 +300,9 @@ def kv_chain_cli_environment(args: argparse.Namespace):
         os.environ["OPTIZ_QWEN_KV_CHAIN_V_BITS"] = str(getattr(args, "kv_chain_v_bits", 4))
         os.environ["OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE"] = str(getattr(args, "kv_chain_group_size", 32))
         os.environ["OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH"] = str(getattr(args, "kv_chain_residual_length", 32))
+    else:
+        for key in KV_CHAIN_ENV_KEYS:
+            os.environ.pop(key, None)
     try:
         yield
     finally:
@@ -314,6 +333,29 @@ def visual_cli_environment(args: argparse.Namespace):
     budget = getattr(args, "visual_pixel_budget", None)
     if budget is not None:
         os.environ["OPTIZ_QWEN_VISUAL_PIXEL_BUDGET"] = str(budget)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
+def tome_cli_environment(args: argparse.Namespace):
+    previous = {key: os.environ.get(key) for key in TOME_ENV_KEYS}
+    if getattr(args, "enable_tome", False):
+        os.environ["OPTIZ_QWEN_TOME_ENABLED"] = "1"
+        os.environ["OPTIZ_QWEN_TOME_LAYER"] = str(getattr(args, "tome_layer", 12))
+        os.environ["OPTIZ_QWEN_TOME_R"] = str(getattr(args, "tome_r", 1))
+        os.environ["OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION"] = (
+            "1" if getattr(args, "tome_proportional_attention", False) else "0"
+        )
+    else:
+        for key in TOME_ENV_KEYS:
+            os.environ.pop(key, None)
     try:
         yield
     finally:
@@ -363,6 +405,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         kv_chain_cli_environment(args),
         runner_cli_environment(args),
         visual_cli_environment(args),
+        tome_cli_environment(args),
     ):
         kivi_env_enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}
         kv_chain_env_enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -435,7 +478,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     elapsed = time.perf_counter() - benchmark_start
     payload = {
-        "benchmark_version": "dndx_public_self_test",
+        "benchmark_version": "dndx_public_self_test_v1.1",
         "timestamp": datetime.now().isoformat(),
         "dataset_path": str(dataset_path),
         "sample_count": len(samples),
@@ -446,6 +489,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "source_sample_count": len(all_samples),
         },
         "backend": model.backend_name,
+        "generation": {"max_new_tokens": args.max_new_tokens},
         "optimization": {
             "generation_runner": getattr(args, "generation_runner", "generate"),
             "visual_pixel_budget": getattr(args, "visual_pixel_budget", None),
@@ -453,6 +497,14 @@ def run_benchmark(args: argparse.Namespace) -> dict:
                 "OCR and fine-grained localization require accuracy validation"
                 if getattr(args, "visual_pixel_budget", None) is not None
                 else None
+            ),
+            "tome_enabled": bool(getattr(args, "enable_tome", False)),
+            "tome_layer": getattr(args, "tome_layer", None) if getattr(args, "enable_tome", False) else None,
+            "tome_r": getattr(args, "tome_r", None) if getattr(args, "enable_tome", False) else None,
+            "tome_proportional_attention": (
+                bool(getattr(args, "tome_proportional_attention", False))
+                if getattr(args, "enable_tome", False)
+                else False
             ),
             "kivi_kv_cache_requested_by_cli": bool(args.enable_kivi_kv_cache),
             "kivi_kv_cache_enabled_by_env": kivi_env_enabled,

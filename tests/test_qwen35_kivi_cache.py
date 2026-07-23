@@ -372,12 +372,22 @@ def test_kv_chain_selector_uses_qserve_defaults(monkeypatch) -> None:
 
 
 def test_kv_chain_selector_falls_back_to_legacy_kivi(monkeypatch) -> None:
+    sentinel_cache = object()
+
+    def fake_build_kv_chain(**kwargs):
+        report = type("Report", (), {"chain_name": kwargs["chain_name"]})()
+        return sentinel_cache, report
+
+    monkeypatch.setattr(
+        "optiz_qwen.evaluation.dndx_wrapper.build_kv_chain",
+        fake_build_kv_chain,
+    )
     model = VLMModel("unused", backend="dummy")
     model._model = type("Model", (), {"config": MinimalQwenConfig()})()
     monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN_ENABLED", raising=False)
     monkeypatch.setenv("OPTIZ_QWEN_KIVI_KV_CACHE", "1")
 
-    assert isinstance(model._build_kivi_cache_if_enabled(), Qwen35KiviCache)
+    assert model._build_kivi_cache_if_enabled() is sentinel_cache
 
 
 def test_kv_chain_selector_builds_fused_qserve(monkeypatch) -> None:

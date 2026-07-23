@@ -1,0 +1,7 @@
+label,accuracy,delta_accuracy,prune_pct,original_tokens,retained_tokens,pruned_tokens,ttft_ms,delta_ttft_ms,generate_wall_ms,delta_generate_wall_ms,decode_after_first_chunk_ms,delta_decode_after_first_chunk_ms,throughput,delta_throughput,preprocess_ms,device_transfer_ms,avg_chunk_interval_ms,path
+baseline,0.76,0.0,0.0,0.0,0.0,0.0,1543.746,0.0,2229.53952,0.0,685.79402,0.0,15.962,0.0,4.0614,2.01822,169.04092,benchmarks/output/result_dev_en_50_baseline_accuracy_mps.json
+L4 R50,0.72,-0.04,50.020991,95.28,47.62,47.66,2791.863,1248.117,3724.77362,1495.2341,932.91074,247.11672,11.449,-4.513,5.40022,3.96498,237.26504,benchmarks/output/result_dev_en_50_attention_received_l4_r0_5_mps.json
+L4 R75,0.72,-0.04,25.020991,95.28,71.44,23.84,4009.048,2465.302,5606.75174,3377.21222,1597.70382,911.9098,8.539,-7.423,6.00748,4.4481,367.27012,benchmarks/output/result_dev_en_50_attention_received_l4_r0_75_mps.json
+L8 R50,0.74,-0.02,50.020991,95.28,47.62,47.66,3507.515,1963.769,4675.55362,2446.0141,1168.03894,482.24492,10.632,-5.33,5.4569,4.06374,275.27128,benchmarks/output/result_dev_en_50_attention_received_l8_r0_5_mps.json
+L8 R75,0.72,-0.04,25.020991,95.28,71.44,23.84,1435.739,-108.007,2186.91376,-42.62576,751.17448,65.38046,15.099,-0.863,4.48504,2.92482,174.4343,benchmarks/output/result_dev_en_50_attention_received_l8_r0_75_mps.json
+L12 R50,0.74,-0.02,50.020991,95.28,47.62,47.66,1692.006,148.26,2468.99984,239.46032,776.99404,91.20002,14.126,-1.836,4.2478,2.83112,188.93168,benchmarks/output/result_dev_en_50_attention_received_l12_r0_5_mps.json

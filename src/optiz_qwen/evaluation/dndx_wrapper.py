@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any
 
 from optiz_qwen.evaluation.answer_parsing import parse_choice_answer
-from optiz_qwen.compression import KiviConfig, QServeKvConfig
+from optiz_qwen.compression import (
+    KiviConfig,
+    QServeKvConfig,
+    Qwen35TomeConfig,
+    get_qwen35_tome_runtime,
+    install_qwen35_tome,
+)
 from optiz_qwen.scheduling import build_kv_chain, run_greedy_prefill_decode
 
 
@@ -124,7 +130,24 @@ class VLMModel:
         if self._resolved_device != "cpu":
             self._model = self._model.to(self._resolved_device)
         self._model = self._model.eval()
+        self._configure_tome()
         self._tokenizer = getattr(self._processor, "tokenizer", None)
+
+    def _configure_tome(self) -> None:
+        enabled = os.environ.get("OPTIZ_QWEN_TOME_ENABLED", "").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            self._tome_config = None
+            return
+        config = Qwen35TomeConfig(
+            layer=int(os.environ.get("OPTIZ_QWEN_TOME_LAYER", "12")),
+            r=int(os.environ.get("OPTIZ_QWEN_TOME_R", "1")),
+            proportional_attention=os.environ.get(
+                "OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION",
+                "",
+            ).strip().lower() in {"1", "true", "yes", "on"},
+        )
+        install_qwen35_tome(self._model, config)
+        self._tome_config = config
 
     def _configure_visual_token_budget(self) -> None:
         value = os.environ.get("OPTIZ_QWEN_VISUAL_PIXEL_BUDGET", "").strip()
@@ -350,6 +373,11 @@ class VLMModel:
                 "backend": "transformers",
                 "generation_runner": "greedy" if use_prefill_decode else "generate",
                 "visual_pixel_budget": getattr(self, "_visual_pixel_budget", None),
+                "tome": (
+                    get_qwen35_tome_runtime(self._model)
+                    if getattr(self, "_tome_config", None) is not None
+                    else None
+                ),
                 "kv_chain": kv_report.__dict__ if kv_report is not None else None,
                 "kv_runtime": cache_runtime,
                 "prefill_decode_runtime": runtime_stats.__dict__ if runtime_stats is not None else None,
