@@ -581,7 +581,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     git = inspect_git(repo_root)
-    if not git.get("git_available") or git.get("git_dirty"):
+    if not git.get("git_available"):
+        raise ValueError(
+            "Git metadata is unavailable. Run inside a Git clone with git on PATH."
+        )
+    if git.get("git_dirty"):
         raise ValueError("AWQ dry-run and execution require a clean Git worktree.")
     model_path = (
         args.model_path.expanduser().resolve()
