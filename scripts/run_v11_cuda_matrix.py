@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-RUNNER_VERSION = "RERUN-v0.1.1"
+RUNNER_VERSION = "RERUN-v1.1"
 EXPECTED_BENCHMARK_VERSION = "dndx_public_self_test_v1.1"
 
 
@@ -22,6 +22,7 @@ class CaseSpec:
     name: str
     model_path: Path
     enable_gdn_fastpath: bool
+    benchmark_args: tuple[str, ...] = ()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -42,8 +43,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cases",
         nargs="+",
-        choices=["baseline", "gdn-fast", "awq", "awq-gdn"],
-        default=["baseline", "gdn-fast", "awq", "awq-gdn"],
+        choices=[
+            "baseline",
+            "gdn-fast",
+            "awq",
+            "awq-gdn",
+        ],
+        default=None,
+        help=(
+            "Advanced matrix mode. Omit this option for one default-off run "
+            "selected by --enable-awq/--enable-gdn-fastpath."
+        ),
+    )
+    parser.add_argument(
+        "--enable-awq",
+        action="store_true",
+        help="Use the externally prepared AWQ W4A16 model. Disabled by default.",
+    )
+    parser.add_argument(
+        "--enable-gdn-fastpath",
+        action="store_true",
+        help="Expose the isolated GDN CUDA overlay. Disabled by default.",
     )
     parser.add_argument(
         "--num-samples",
@@ -99,7 +119,12 @@ def model_identity(path: Path) -> dict[str, Any]:
     }
 
 
-def run_capture(command: list[str], *, cwd: Path | None = None) -> dict[str, Any]:
+def run_capture(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
     try:
         completed = subprocess.run(
             command,
@@ -107,6 +132,7 @@ def run_capture(command: list[str], *, cwd: Path | None = None) -> dict[str, Any
             check=False,
             capture_output=True,
             text=True,
+            env=env,
         )
     except FileNotFoundError as exc:
         return {"available": False, "error": str(exc)}
@@ -135,7 +161,7 @@ def package_versions(python: Path) -> dict[str, Any]:
     code = (
         "import importlib.metadata as m,json,platform,sys;"
         "names=['torch','transformers','triton','causal-conv1d','fla-core',"
-        "'llmcompressor','compressed-tensors','sglang'];"
+        "'llmcompressor','compressed-tensors'];"
         "versions={};"
         "\nfor name in names:\n"
         "  try: versions[name]=m.version(name)\n"
@@ -149,8 +175,25 @@ def package_versions(python: Path) -> dict[str, Any]:
     return {"probe": probe}
 
 
+def resolve_case_names(args: argparse.Namespace) -> tuple[list[str], str]:
+    if args.cases is not None:
+        if args.enable_awq or args.enable_gdn_fastpath:
+            raise ValueError(
+                "--cases cannot be combined with --enable-awq or "
+                "--enable-gdn-fastpath."
+            )
+        return list(dict.fromkeys(args.cases)), "explicit-cases"
+    if args.enable_awq and args.enable_gdn_fastpath:
+        return ["awq-gdn"], "default-off-switches"
+    if args.enable_awq:
+        return ["awq"], "default-off-switches"
+    if args.enable_gdn_fastpath:
+        return ["gdn-fast"], "default-off-switches"
+    return ["baseline"], "default-off-switches"
+
+
 def resolve_cases(args: argparse.Namespace) -> list[CaseSpec]:
-    requested = list(dict.fromkeys(args.cases))
+    requested, _selection_mode = resolve_case_names(args)
     needs_awq = any(name in {"awq", "awq-gdn"} for name in requested)
     needs_gdn = any(name in {"gdn-fast", "awq-gdn"} for name in requested)
     if needs_awq and args.awq_model_path is None:
@@ -165,6 +208,68 @@ def resolve_cases(args: argparse.Namespace) -> list[CaseSpec]:
         "awq-gdn": CaseSpec("awq-gdn", args.awq_model_path, True),
     }
     return [mapping[name] for name in requested]
+
+
+def inspect_awq_artifact(path: Path) -> dict[str, Any]:
+    config_path = path / "config.json"
+    report: dict[str, Any] = {
+        "path": str(path.resolve()),
+        "config_present": config_path.is_file(),
+        "weight_files": sorted(item.name for item in path.glob("*.safetensors")),
+        "ready": False,
+        "errors": [],
+    }
+    if not config_path.is_file():
+        report["errors"].append("config.json is missing.")
+        return report
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        report["errors"].append(f"config.json is unreadable: {type(exc).__name__}")
+        return report
+    quantization = config.get("quantization_config")
+    if not isinstance(quantization, dict):
+        report["errors"].append("quantization_config is missing.")
+        return report
+    groups = quantization.get("config_groups")
+    if not isinstance(groups, dict) or not groups:
+        report["errors"].append("quantization config_groups are missing.")
+        return report
+    target_count = 0
+    valid_w4_groups = 0
+    for group in groups.values():
+        if not isinstance(group, dict):
+            continue
+        targets = group.get("targets")
+        if isinstance(targets, list):
+            target_count += len(targets)
+        weights = group.get("weights")
+        if (
+            isinstance(weights, dict)
+            and weights.get("num_bits") == 4
+            and group.get("input_activations") is None
+        ):
+            valid_w4_groups += 1
+    report.update(
+        {
+            "quant_method": quantization.get("quant_method"),
+            "quantization_status": quantization.get("quantization_status"),
+            "format": quantization.get("format"),
+            "group_count": len(groups),
+            "valid_w4a16_group_count": valid_w4_groups,
+            "target_count": target_count,
+        }
+    )
+    if not report["weight_files"]:
+        report["errors"].append("No safetensors weights were found.")
+    if quantization.get("quant_method") != "compressed-tensors":
+        report["errors"].append("quant_method is not compressed-tensors.")
+    if quantization.get("quantization_status") != "compressed":
+        report["errors"].append("quantization_status is not compressed.")
+    if valid_w4_groups != len(groups) or target_count <= 0:
+        report["errors"].append("The artifact is not a complete W4A16 target set.")
+    report["ready"] = not report["errors"]
+    return report
 
 
 def build_environment(
@@ -186,6 +291,65 @@ def build_environment(
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     return env
+
+
+def probe_gdn_fastpath(
+    *,
+    python: Path,
+    code_root: Path,
+    spec: CaseSpec,
+    gdn_overlay: Path | None,
+    seed: int,
+    cuda_visible_devices: str,
+) -> dict[str, Any]:
+    env = build_environment(
+        code_root=code_root,
+        spec=spec,
+        gdn_overlay=gdn_overlay,
+        seed=seed,
+        cuda_visible_devices=cuda_visible_devices,
+    )
+    probe = run_capture(
+        [
+            str(python),
+            str(code_root / "scripts" / "check_gdn_fastpath.py"),
+            "--require-cuda",
+        ],
+        cwd=code_root,
+        env=env,
+    )
+    report = None
+    if probe.get("stdout"):
+        try:
+            report = json.loads(probe["stdout"])
+        except json.JSONDecodeError:
+            report = None
+    return {
+        "returncode": probe.get("returncode"),
+        "stderr": probe.get("stderr"),
+        "report": report,
+    }
+
+
+def validate_gdn_probes(
+    *,
+    baseline_probe: dict[str, Any],
+    enabled_probe: dict[str, Any] | None,
+) -> None:
+    baseline_report = baseline_probe.get("report") or {}
+    baseline_route = baseline_report.get("transformers_fastpath") or {}
+    if baseline_route.get("is_fast_path_available") is True:
+        raise RuntimeError(
+            "GDN fast path is visible in the baseline environment. Use an isolated "
+            "overlay instead of installing GDN packages into the base environment."
+        )
+    if enabled_probe is None:
+        return
+    enabled_report = enabled_probe.get("report") or {}
+    if enabled_probe.get("returncode") != 0 or enabled_report.get("ready") is not True:
+        raise RuntimeError(
+            "GDN fast path was requested but the CUDA readiness probe failed."
+        )
 
 
 def validate_result(
@@ -276,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     output_root = args.output_root.resolve()
     python = executable_path(args.python)
     dataset_path = args.dataset_path.resolve()
+    requested_case_names, selection_mode = resolve_case_names(args)
     cases = resolve_cases(args)
     for path in [code_root, dataset_path, python, *(spec.model_path for spec in cases)]:
         if not path.exists():
@@ -283,6 +448,39 @@ def main(argv: list[str] | None = None) -> int:
     if any(spec.enable_gdn_fastpath for spec in cases):
         if args.gdn_overlay is None or not args.gdn_overlay.resolve().is_dir():
             raise FileNotFoundError(args.gdn_overlay)
+    awq_artifacts: dict[str, Any] = {}
+    for spec in cases:
+        if spec.name in {"awq", "awq-gdn"}:
+            artifact_path = str(spec.model_path.resolve())
+            if artifact_path not in awq_artifacts:
+                awq_artifacts[artifact_path] = inspect_awq_artifact(spec.model_path)
+            if not awq_artifacts[artifact_path]["ready"]:
+                raise RuntimeError(
+                    f"AWQ was requested but the artifact is invalid: {artifact_path}"
+                )
+
+    baseline_probe = probe_gdn_fastpath(
+        python=python,
+        code_root=code_root,
+        spec=CaseSpec("baseline-probe", args.baseline_model_path, False),
+        gdn_overlay=None,
+        seed=args.seed,
+        cuda_visible_devices=args.cuda_visible_devices,
+    )
+    enabled_probe = None
+    if any(spec.enable_gdn_fastpath for spec in cases):
+        enabled_probe = probe_gdn_fastpath(
+            python=python,
+            code_root=code_root,
+            spec=CaseSpec("gdn-probe", args.baseline_model_path, True),
+            gdn_overlay=args.gdn_overlay,
+            seed=args.seed,
+            cuda_visible_devices=args.cuda_visible_devices,
+        )
+    validate_gdn_probes(
+        baseline_probe=baseline_probe,
+        enabled_probe=enabled_probe,
+    )
 
     identity = git_identity(code_root)
     if args.expected_commit and identity["head"] != args.expected_commit:
@@ -306,6 +504,18 @@ def main(argv: list[str] | None = None) -> int:
             for spec in cases
         },
         "python": package_versions(python),
+        "switches": {
+            "default_enabled": False,
+            "selection_mode": selection_mode,
+            "enable_awq_requested": bool(args.enable_awq),
+            "enable_gdn_fastpath_requested": bool(args.enable_gdn_fastpath),
+            "effective_cases": requested_case_names,
+        },
+        "readiness": {
+            "awq_artifacts": awq_artifacts,
+            "gdn_baseline_environment": baseline_probe,
+            "gdn_enabled_environment": enabled_probe,
+        },
         "gpu": run_capture(
             [
                 "nvidia-smi",
@@ -382,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
             ]
             if args.num_samples:
                 command.extend(["--num-samples", str(args.num_samples)])
+            command.extend(spec.benchmark_args)
 
             print(f"[run] {spec.name} {run_index}/{args.repeats}", flush=True)
             with log_path.open("w", encoding="utf-8") as log_handle:

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import math
 import sys
 from pathlib import Path
@@ -88,3 +89,102 @@ def test_python_launcher_symlink_is_preserved(tmp_path: Path) -> None:
 
     assert MODULE.executable_path(launcher) == launcher.absolute()
     assert MODULE.executable_path(launcher) != launcher.resolve()
+
+
+def _switch_args(*extra: str):
+    return MODULE.parse_args(
+        [
+            "--dataset-path",
+            "dataset.tsv",
+            "--baseline-model-path",
+            "model",
+            "--output-root",
+            "output",
+            *extra,
+        ]
+    )
+
+
+def test_default_switches_select_only_baseline() -> None:
+    args = _switch_args()
+
+    names, mode = MODULE.resolve_case_names(args)
+    [spec] = MODULE.resolve_cases(args)
+
+    assert names == ["baseline"]
+    assert mode == "default-off-switches"
+    assert spec.name == "baseline"
+    assert spec.enable_gdn_fastpath is False
+
+
+def test_awq_and_gdn_switches_select_combined_case() -> None:
+    args = _switch_args(
+        "--awq-model-path",
+        "awq-model",
+        "--gdn-overlay",
+        "gdn-overlay",
+        "--enable-awq",
+        "--enable-gdn-fastpath",
+    )
+
+    [spec] = MODULE.resolve_cases(args)
+
+    assert spec.name == "awq-gdn"
+    assert spec.model_path == Path("awq-model")
+    assert spec.enable_gdn_fastpath is True
+
+
+def test_explicit_cases_cannot_be_mixed_with_default_off_switches() -> None:
+    import pytest
+
+    args = _switch_args("--cases", "baseline", "--enable-awq")
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        MODULE.resolve_case_names(args)
+
+
+def test_awq_artifact_requires_compressed_w4a16_metadata(tmp_path: Path) -> None:
+    model = tmp_path / "awq"
+    model.mkdir()
+    (model / "model.safetensors").write_bytes(b"weights")
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "quantization_status": "compressed",
+                    "format": "pack-quantized",
+                    "config_groups": {
+                        "group_0": {
+                            "targets": ["model.layer.proj"],
+                            "weights": {"num_bits": 4},
+                            "input_activations": None,
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = MODULE.inspect_awq_artifact(model)
+
+    assert report["ready"] is True
+    assert report["valid_w4a16_group_count"] == 1
+    assert report["target_count"] == 1
+
+
+def test_gdn_probe_validation_rejects_contaminated_baseline() -> None:
+    import pytest
+
+    baseline = {
+        "report": {
+            "transformers_fastpath": {"is_fast_path_available": True}
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="baseline environment"):
+        MODULE.validate_gdn_probes(
+            baseline_probe=baseline,
+            enabled_probe=None,
+        )
