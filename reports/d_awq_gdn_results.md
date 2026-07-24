@@ -120,7 +120,7 @@ AWQ 加载完成时参数占用较低，但 warmup 后稳定峰值没有下降�
 - AWQ W4A16 dry-run recipe；
 - GDN baseline/overlay 隔离检查；
 - baseline、GDN、AWQ、AWQ+GDN 各 1 题端到端冒烟；
-- 全仓库测试：`96 passed, 1 skipped`。
+- 干净 PR 分支全仓库测试：`91 passed, 1 skipped`。
 
 完整复现与四种开关命令见 `docs/D方向_AWQ_GDN复现与提交.md`。
 
