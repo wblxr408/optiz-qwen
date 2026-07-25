@@ -1,0 +1,6 @@
+# Install the matched PyTorch pair from the official cu128 index before this file:
+# python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+
+transformers==5.10.1
+llmcompressor[qwen]==0.12.0
+compressed-tensors==0.17.1

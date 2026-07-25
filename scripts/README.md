@@ -8,6 +8,23 @@ This directory is reserved for executable workflow entrypoints such as:
 - data-preparation helpers
 - benchmark collection
 
+## D-direction AWQ/GDN switches
+
+`run_v11_cuda_matrix.py` has two explicit, default-off switches:
+
+- `--enable-awq`
+- `--enable-gdn-fastpath`
+
+With neither switch, exactly one baseline case is selected. The AWQ model and
+GDN overlay are external artifacts: the runner never downloads, installs, or
+generates them during a benchmark. It validates W4A16 metadata, checks that the
+GDN CUDA route is active when requested, and rejects a baseline environment
+that already exposes the GDN fast path.
+
+Results are in `reports/d_awq_gdn_results.md`. The complete from-scratch
+preparation and four command examples are in
+`docs/D方向_AWQ_GDN复现与提交.md`.
+
 At the current stage, model download and one-sample smoke-test helpers are in
 place, while the broader optimization workflow scripts are still skeletal.
 

@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "experiment_id": "d-awq-w4a16-rtx5090d-v0.1",
+  "execution_enabled": false,
+  "claim_boundary": "cuda_algorithm_control_only_not_ppu_evidence",
+  "model": {
+    "identifier": "Qwen/Qwen3.5-2B",
+    "path": "resources/model_weights/raw/Qwen3.5-2B",
+    "expected_model_type": "qwen3_5",
+    "expected_architecture": "Qwen3_5ForConditionalGeneration"
+  },
+  "environment": {
+    "python": "3.12",
+    "torch": "2.10.0+cu128",
+    "torchvision": "0.25.0+cu128",
+    "transformers": "5.10.1",
+    "llmcompressor": "0.12.0",
+    "compressed_tensors": "0.17.1",
+    "install_into_existing_bf16_environment": false
+  },
+  "calibration": {
+    "dataset": "resources/eval_dataset/raw/mmbench_public/mmbench_dev_en.tsv",
+    "expected_dataset_sha256": "3ad812cc32d158537cba0d1e67551630b59e663cefb445d44700a30dfb984b31",
+    "num_samples": 128,
+    "seed": 20260712,
+    "exclude_fixed_eval_prefix_count": 10,
+    "require_real_decoded_images": true,
+    "require_auto_processor_inputs": true,
+    "require_sample_id_manifest": true
+  },
+  "quantization": {
+    "candidate_id": "conservative-language-attention-mlp-v1",
+    "algorithm": "AWQ",
+    "scheme": "W4A16_ASYM",
+    "targets_source": "module_inventory.conservative_candidate.selected_names",
+    "awq_mapping_policy": "full_attention_and_language_mlp_only",
+    "duo_scaling": "both",
+    "n_grid": 20,
+    "offload_device": "cpu",
+    "pipeline": "sequential",
+    "batch_size": 1,
+    "max_seq_length": 2048,
+    "ignore_policy_status": "resolved_by_exact_module_inventory_partition",
+    "semantic_ignore_groups": [
+      "vision_encoder",
+      "multimodal_projector",
+      "embeddings",
+      "normalization_layers",
+      "lm_head",
+      "mtp_modules",
+      "gated_deltanet_state_sensitive_modules"
+    ]
+  },
+  "verification_gates": {
+    "same_environment_bf16_baseline_required": true,
+    "calibration_eval_overlap_must_be_zero": true,
+    "artifact_content_manifest_required": true,
+    "compressed_tensor_evidence_required": true,
+    "transformers_reload_required": true,
+    "one_token_multimodal_generation_required": true,
+    "ten_sample_accuracy_smoke_required": true,
+    "performance_claim_allowed": false
+  }
+}

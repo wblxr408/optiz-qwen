@@ -83,6 +83,18 @@ python benchmark_public.py --backend transformers --device cuda --enable-kivi-kv
 The baseline remains KIVI-off by default.  KIVI can also be enabled with
 `OPTIZ_QWEN_KIVI_KV_CACHE=1` for compatibility with earlier scripts.
 
+## Optional D-direction AWQ/GDN experiments
+
+The D-direction branch provides reproducible, default-off AWQ W4A16 and Qwen3.5
+GDN CUDA fast-path experiments. Running `scripts/run_v11_cuda_matrix.py` without
+either optimization switch selects only the original baseline.
+
+See:
+
+- `reports/d_awq_gdn_results.md` for measured results and claim boundaries
+- `docs/D方向_AWQ_GDN复现与提交.md` for environment setup, AWQ generation, GDN
+  overlay isolation, and benchmark commands
+
 ## Missing external assets
 
 See `resources/MANIFEST.md`.
