@@ -28,7 +28,8 @@ def run_greedy_prefill_decode(
     max_new_tokens: int,
     tokenizer: Any,
     eos_token_id: int | None = None,
-    kivi_cache: Any | None = None,
+    kv_cache: Any | None = None,
+    post_prefill_callback: Any | None = None,
 ) -> tuple[torch.Tensor, PrefillDecodeStats]:
     """Run a greedy prefill + token-by-token decode loop.
 
@@ -50,11 +51,15 @@ def run_greedy_prefill_decode(
     prompt_tokens = int(input_ids.shape[-1])
     prefill_inputs = dict(inputs)
     prefill_inputs["use_cache"] = True
-    if kivi_cache is not None:
-        prefill_inputs["past_key_values"] = kivi_cache
+    defer_prefill_cache = bool(
+        kv_cache is not None and getattr(kv_cache, "defer_prefill_cache_injection", False)
+    )
+    if kv_cache is not None:
+        if not defer_prefill_cache:
+            prefill_inputs["past_key_values"] = kv_cache
         attention_mask = inputs.get("attention_mask")
         dense_decode_mask = attention_mask is None or bool(torch.all(attention_mask == 1).item())
-        setattr(kivi_cache, "_optiz_dense_decode_mask", dense_decode_mask)
+        setattr(kv_cache, "_optiz_dense_decode_mask", dense_decode_mask)
 
     _synchronize_device(input_ids)
     prefill_start = time.perf_counter()
@@ -79,6 +84,16 @@ def run_greedy_prefill_decode(
             ttft_seconds=elapsed,
             elapsed_seconds=elapsed,
         )
+
+    if defer_prefill_cache:
+        if past_key_values is None:
+            raise RuntimeError("native prefill did not return a cache for deferred qserve decode.")
+        # This bookkeeping is required for decode, but it is not part of the
+        # model's first-token computation and must not contaminate TTFT.
+        kv_cache.adopt_native_prefill_cache(past_key_values)
+        past_key_values = kv_cache
+    if post_prefill_callback is not None:
+        post_prefill_callback()
 
     decode_start = first_token_at
     attention_mask = inputs.get("attention_mask")

@@ -1,7 +1,7 @@
 """QServe-inspired Qwen3.5 KV-cache adapter.
 
 This module keeps the competition scope constrained to KV-only changes, but
-implements a distinct chain from the upstream KIVI adapter:
+implements the retained deferred split packed-KV experiment:
 
 - 4-bit groupwise KV quantization
 - progressive quantization with a dense residual window
@@ -48,7 +48,7 @@ class QServeKvCacheReport:
     v_bits: int
     group_size: int
     residual_length: int
-    implementation: str = "qserve_kv4_local"
+    implementation: str = "qserve_deferred_split_packed_kv"
 
 
 class QServeAttentionLayer(CacheLayerMixin):
@@ -389,10 +389,6 @@ class QServeKvCache(DynamicCache):
         return f"QServeKvCache({self.report()})"
 
 
-def build_qserve_kv_cache(model_config: Any, qserve_config: QServeKvConfig | None = None) -> QServeKvCache:
-    return QServeKvCache(model_config=model_config, qserve_config=qserve_config)
-
-
 class QServeFusedAttentionLayer(QServeAttentionLayer):
     """Cache layer that keeps decode KV packed for the fused attention path."""
 
@@ -434,8 +430,122 @@ class QServeFusedKvCache(QServeKvCache):
         return f"QServeFusedKvCache({self.report()})"
 
 
-def build_qserve_fused_kv_cache(
+class QServeSplitFusedKvCache(QServeFusedKvCache):
+    """Fused cache selecting the two-stage packed-KV decode backend."""
+
+    attention_backend = "triton_int4_split_decode"
+
+    def __repr__(self) -> str:
+        return f"QServeSplitFusedKvCache({self.report()})"
+
+
+class QServeDeferredSplitFusedAttentionLayer(QServeFusedAttentionLayer):
+    """Keeps prefill KV dense, then packs it just before the first decode step."""
+
+    def __init__(self, config: QServeKvConfig) -> None:
+        super().__init__(config)
+        self._deferred_prefill = False
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
+
+        if self._seq_length == 0:
+            # The first output token is produced from prefill logits.  Keeping
+            # this cache dense until the next model call removes quantization
+            # from TTFT while preserving the packed decode representation.
+            self.dtype = key_states.dtype
+            self.device = key_states.device
+            self._seq_length = int(key_states.shape[-2])
+            self.keys = key_states
+            self.values = value_states
+            self._deferred_prefill = True
+            return key_states, value_states
+
+        if self._deferred_prefill:
+            prefill_keys = self.keys
+            prefill_values = self.values
+            if prefill_keys is None or prefill_values is None:
+                raise RuntimeError("deferred qserve prefill cache is missing dense KV tensors.")
+            self._deferred_prefill = False
+            self._rebuild_from_full(
+                torch.cat([prefill_keys, key_states], dim=-2).contiguous(),
+                torch.cat([prefill_values, value_states], dim=-2).contiguous(),
+            )
+            return key_states, value_states
+
+        return super().update(key_states, value_states, *args, **kwargs)
+
+    def adopt_prefill(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        """Adopt dense KV produced by the native prefill cache without repacking it."""
+
+        self.lazy_initialization(key_states, value_states)
+        self._seq_length = int(key_states.shape[-2])
+        self.keys = key_states.contiguous()
+        self.values = value_states.contiguous()
+        self._deferred_prefill = True
+
+    def materialize(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._deferred_prefill:
+            if self.keys is None or self.values is None:
+                raise RuntimeError("deferred qserve prefill cache is missing dense KV tensors.")
+            return self.keys, self.values
+        return super().materialize()
+
+    def reset(self) -> None:
+        super().reset()
+        self._deferred_prefill = False
+
+
+class QServeDeferredSplitFusedKvCache(QServeSplitFusedKvCache):
+    """Split decode cache that shifts prefill quantization out of TTFT."""
+
+    attention_backend = "triton_int4_split_decode"
+    defer_prefill_cache_injection = True
+
+    def __init__(self, model_config: Any, qserve_config: QServeKvConfig | None = None) -> None:
+        super().__init__(model_config=model_config, qserve_config=qserve_config)
+        for layer_idx in self.full_attention_layers:
+            self.layers[layer_idx] = QServeDeferredSplitFusedAttentionLayer(self.qserve_config)
+
+    def adopt_native_prefill_cache(self, native_cache: Any) -> None:
+        """Transfer native prefill state, replacing only full-attention cache layers."""
+
+        native_layers = getattr(native_cache, "layers", None)
+        if native_layers is None:
+            raise TypeError("native prefill cache does not expose cache layers.")
+        if len(native_layers) != len(self.layers):
+            raise ValueError("native prefill cache depth does not match the Qwen3.5 cache.")
+        for layer_idx, native_layer in enumerate(native_layers):
+            if layer_idx not in self.full_attention_layers:
+                self.layers[layer_idx] = native_layer
+                continue
+            key_states = getattr(native_layer, "keys", None)
+            value_states = getattr(native_layer, "values", None)
+            if key_states is None or value_states is None:
+                raise RuntimeError(f"native full-attention layer {layer_idx} has no dense KV to adopt.")
+            qserve_layer = self.layers[layer_idx]
+            if not isinstance(qserve_layer, QServeDeferredSplitFusedAttentionLayer):
+                raise TypeError("deferred split cache lost its full-attention layer type.")
+            qserve_layer.adopt_prefill(key_states, value_states)
+        for attribute in ("_seen_tokens", "_max_batch_size", "_max_cache_len"):
+            if hasattr(native_cache, attribute):
+                setattr(self, attribute, getattr(native_cache, attribute))
+
+    def __repr__(self) -> str:
+        return f"QServeDeferredSplitFusedKvCache({self.report()})"
+
+
+def build_qserve_deferred_split_fused_kv_cache(
     model_config: Any,
     qserve_config: QServeKvConfig | None = None,
-) -> QServeFusedKvCache:
-    return QServeFusedKvCache(model_config=model_config, qserve_config=qserve_config)
+) -> QServeDeferredSplitFusedKvCache:
+    return QServeDeferredSplitFusedKvCache(model_config=model_config, qserve_config=qserve_config)

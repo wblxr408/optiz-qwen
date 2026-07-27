@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 
+import pytest
 from optiz_qwen.evaluation.answer_parsing import parse_choice_answer
 from evaluation_wrapper import GenerationConfig, GenerationResult, VLMModel
 from optiz_qwen.evaluation.dndx_public_benchmark import (
@@ -12,7 +13,6 @@ from optiz_qwen.evaluation.dndx_public_benchmark import (
     compute_throughput,
     extract_answer,
     fixed_generation_config,
-    kivi_cli_environment,
     kv_chain_cli_environment,
     Sample,
     select_samples,
@@ -72,46 +72,12 @@ def test_default_paths_match_repo_layout() -> None:
     assert fixed_generation_config().max_new_tokens == 256
 
 
-def test_kivi_cli_environment_sets_and_restores_env(monkeypatch) -> None:
-    monkeypatch.delenv("OPTIZ_QWEN_KIVI_KV_CACHE", raising=False)
-    args = Namespace(
-        enable_kivi_kv_cache=True,
-        kivi_k_bits=2,
-        kivi_v_bits=4,
-        kivi_group_size=32,
-        kivi_residual_length=64,
-    )
-
-    with kivi_cli_environment(args):
-        import os
-
-        assert os.environ["OPTIZ_QWEN_KIVI_KV_CACHE"] == "1"
-        assert os.environ["OPTIZ_QWEN_KIVI_V_BITS"] == "4"
-        assert os.environ["OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH"] == "64"
-
-    import os
-
-    assert "OPTIZ_QWEN_KIVI_KV_CACHE" not in os.environ
-
-
-def test_kivi_cli_environment_disables_inherited_setting(monkeypatch) -> None:
-    monkeypatch.setenv("OPTIZ_QWEN_KIVI_KV_CACHE", "1")
-    args = Namespace(enable_kivi_kv_cache=False)
-
-    with kivi_cli_environment(args):
-        import os
-
-        assert "OPTIZ_QWEN_KIVI_KV_CACHE" not in os.environ
-
-    assert os.environ["OPTIZ_QWEN_KIVI_KV_CACHE"] == "1"
-
-
 def test_kv_chain_cli_environment_sets_and_restores_env(monkeypatch) -> None:
     monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN_ENABLED", raising=False)
     monkeypatch.delenv("OPTIZ_QWEN_KV_CHAIN", raising=False)
     args = Namespace(
         enable_kv_chain=True,
-        kv_chain="qserve_kv",
+        kv_chain="qserve_deferred_split_fused_kv",
         kv_chain_k_bits=4,
         kv_chain_v_bits=4,
         kv_chain_group_size=32,
@@ -122,7 +88,7 @@ def test_kv_chain_cli_environment_sets_and_restores_env(monkeypatch) -> None:
         import os
 
         assert os.environ["OPTIZ_QWEN_KV_CHAIN_ENABLED"] == "1"
-        assert os.environ["OPTIZ_QWEN_KV_CHAIN"] == "qserve_kv"
+        assert os.environ["OPTIZ_QWEN_KV_CHAIN"] == "qserve_deferred_split_fused_kv"
 
     import os
 
@@ -132,7 +98,7 @@ def test_kv_chain_cli_environment_sets_and_restores_env(monkeypatch) -> None:
 
 def test_kv_chain_cli_environment_disables_inherited_setting(monkeypatch) -> None:
     monkeypatch.setenv("OPTIZ_QWEN_KV_CHAIN_ENABLED", "1")
-    monkeypatch.setenv("OPTIZ_QWEN_KV_CHAIN", "qserve_kv")
+    monkeypatch.setenv("OPTIZ_QWEN_KV_CHAIN", "qserve_deferred_split_fused_kv")
     args = Namespace(enable_kv_chain=False)
 
     with kv_chain_cli_environment(args):
@@ -142,7 +108,15 @@ def test_kv_chain_cli_environment_disables_inherited_setting(monkeypatch) -> Non
         assert "OPTIZ_QWEN_KV_CHAIN" not in os.environ
 
     assert os.environ["OPTIZ_QWEN_KV_CHAIN_ENABLED"] == "1"
-    assert os.environ["OPTIZ_QWEN_KV_CHAIN"] == "qserve_kv"
+    assert os.environ["OPTIZ_QWEN_KV_CHAIN"] == "qserve_deferred_split_fused_kv"
+
+
+def test_kv_chain_cli_environment_rejects_removed_route() -> None:
+    args = Namespace(enable_kv_chain=True, kv_chain="qserve_kv")
+
+    with pytest.raises(ValueError, match="Only qserve_deferred_split_fused_kv is retained"):
+        with kv_chain_cli_environment(args):
+            pass
 
 
 def test_runner_and_visual_environments_are_scoped(monkeypatch) -> None:

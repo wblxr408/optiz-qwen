@@ -25,7 +25,7 @@
 - 两种模式交替运行，减少固定顺序偏差。
 - 每个计时边界调用 `torch.mps.synchronize()`，避免 MPS 异步执行造成错误归因。
 - forward 使用 `use_cache=True` 和 `logits_to_keep=1`，与正式 `generate()` 的首 Token 路径保持一致。
-- 关闭视觉 Token 剪枝与 KIVI。
+- 关闭视觉 Token 剪枝与 KV Chain。
 
 图文与 text-only 的差值代表在相同问题文本下，引入图片产生的视觉路径增量。模型内部另行记录视觉编码器和语言模型 forward，从而进一步拆分视觉成本。
 

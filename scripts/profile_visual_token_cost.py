@@ -25,7 +25,6 @@ DEFAULT_DATASET_PATH = "./resources/eval_dataset/raw/mmbench_public/mmbench_dev_
 DEFAULT_MODEL_PATH = "./resources/model_weights/raw/Qwen3.5-2B"
 DEFAULT_OUTPUT_PATH = "./benchmarks/output/visual_token_cost_profile_en50_mps.json"
 DISABLED_OPTIMIZATION_ENV_KEYS = (
-    "OPTIZ_QWEN_KIVI_KV_CACHE",
     "OPTIZ_QWEN_KV_CHAIN_ENABLED",
     "OPTIZ_QWEN_TOME_ENABLED",
     "OPTIZ_QWEN_VISUAL_TOKEN_PRUNING",

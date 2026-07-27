@@ -35,8 +35,8 @@ def inspect_ppu_compatibility(root: Path | None = None) -> PpuCompatibilityStatu
     official_materials_available = bool(material_files)
     notes = [
         "PPU compatibility is not declared until target hardware or official compatibility materials are checked.",
-        "Current KIVI KV-cache adapter is validated only through local Python/CUDA smoke paths.",
-        "qB MatMul kernel integration is not enabled for Qwen3.5 VLM in the current adapter.",
+        "The retained deferred packed-KV chain is validated only through local Python/CUDA smoke paths.",
+        "No packed-KV PPU operator integration is implemented for Qwen3.5 VLM.",
     ]
     if not official_materials_available:
         notes.append("PPU reference materials are still missing under resources/ppu_docs/raw/.")

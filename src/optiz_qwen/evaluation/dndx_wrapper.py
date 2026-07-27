@@ -12,7 +12,6 @@ from typing import Any
 
 from optiz_qwen.evaluation.answer_parsing import parse_choice_answer
 from optiz_qwen.compression import (
-    KiviConfig,
     QServeKvConfig,
     Qwen35TomeConfig,
     get_qwen35_tome_runtime,
@@ -257,16 +256,22 @@ class VLMModel:
         )
         kv_chain, kv_report = self._build_kv_chain_if_enabled()
         runner = os.environ.get("OPTIZ_QWEN_GENERATION_RUNNER", "generate").strip().lower()
-        if kv_report is not None and kv_report.chain_name == "qserve_fused_kv":
-            from optiz_qwen.kernels import install_qwen35_fused_attention
-
-            install_qwen35_fused_attention(self._model)
+        deferred_fused_chain = kv_report is not None and kv_report.chain_name == "qserve_deferred_split_fused_kv"
+        if deferred_fused_chain and runner != "greedy":
+            raise ValueError(
+                "qserve_deferred_split_fused_kv requires OPTIZ_QWEN_GENERATION_RUNNER=greedy."
+            )
         use_prefill_decode = generation_config.temperature == 0.0 and runner == "greedy"
         if use_prefill_decode:
             if kv_chain is None:
                 from transformers.cache_utils import DynamicCache
 
                 kv_chain = DynamicCache(config=self._model.config)
+            post_prefill_callback = None
+            if deferred_fused_chain:
+                from optiz_qwen.kernels import install_qwen35_fused_attention
+
+                post_prefill_callback = lambda: install_qwen35_fused_attention(self._model)
             start = time.perf_counter()
             generated_ids, runtime_stats = run_greedy_prefill_decode(
                 self._model,
@@ -274,7 +279,8 @@ class VLMModel:
                 max_new_tokens=generation_config.max_new_tokens,
                 tokenizer=self._tokenizer,
                 eos_token_id=getattr(self._tokenizer, "eos_token_id", None),
-                kivi_cache=kv_chain,
+                kv_cache=kv_chain,
+                post_prefill_callback=post_prefill_callback,
             )
             first_chunk_at = start + runtime_stats.ttft_seconds
             chunks = []
@@ -354,12 +360,12 @@ class VLMModel:
 
         ttft = (first_chunk_at - start) if first_chunk_at is not None else (end - start)
         cache_runtime = None
-        if kv_report is not None and kv_report.chain_name == "qserve_fused_kv":
+        if deferred_fused_chain:
             cache_runtime = {
                 "kernel_calls": int(getattr(kv_chain, "kernel_calls", 0)),
                 "fallback_calls": int(getattr(kv_chain, "fallback_calls", 0)),
                 "active_backend": (
-                    "triton_int4_decode"
+                    getattr(kv_chain, "attention_backend", "triton_int4_decode")
                     if getattr(kv_chain, "kernel_calls", 0) > 0
                     else "torch_materialize_fallback"
                 ),
@@ -389,43 +395,24 @@ class VLMModel:
 
     def _build_kv_chain_if_enabled(self):
         enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower()
-        chain_name = None
-        if enabled in {"1", "true", "yes", "on"}:
-            chain_name = os.environ.get("OPTIZ_QWEN_KV_CHAIN", "qserve_kv").strip().lower()
-        else:
-            legacy_enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower()
-            if legacy_enabled not in {"1", "true", "yes", "on"}:
-                return None, None
-            chain_name = "legacy_kivi"
-
-        kivi_config = KiviConfig(
-            k_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_K_BITS", os.environ.get("OPTIZ_QWEN_KIVI_K_BITS", "2"))),
-            v_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_V_BITS", os.environ.get("OPTIZ_QWEN_KIVI_V_BITS", "2"))),
-            group_size=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE", os.environ.get("OPTIZ_QWEN_KIVI_GROUP_SIZE", "32"))),
-            residual_length=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH", os.environ.get("OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH", "32"))),
+        if enabled not in {"1", "true", "yes", "on"}:
+            return None, None
+        chain_name = os.environ.get(
+            "OPTIZ_QWEN_KV_CHAIN", "qserve_deferred_split_fused_kv"
+        ).strip().lower()
+        qserve_config = QServeKvConfig(
+            k_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_K_BITS", "4")),
+            v_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_V_BITS", "4")),
+            group_size=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE", "32")),
+            residual_length=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH", "32")),
         )
-        qserve_config = None
-        if chain_name in {"qserve_kv", "qserve_fused_kv"}:
-            qserve_config = QServeKvConfig(
-                k_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_K_BITS", "4")),
-                v_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_V_BITS", "4")),
-                group_size=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE", "32")),
-                residual_length=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH", "32")),
-            )
         kv_chain, kv_report = build_kv_chain(
             chain_name=chain_name,
             model_config=self._model.config,
             enabled=True,
-            kivi_config=kivi_config,
             qserve_config=qserve_config,
         )
         return kv_chain, kv_report
-
-    def _build_kivi_cache_if_enabled(self):
-        kv_chain, kv_report = self._build_kv_chain_if_enabled()
-        if kv_report is None or kv_report.chain_name != "legacy_kivi":
-            return None
-        return kv_chain
 
     def _choice_fallback_enabled(self) -> bool:
         value = os.environ.get("OPTIZ_QWEN_CHOICE_FALLBACK", "1").strip().lower()

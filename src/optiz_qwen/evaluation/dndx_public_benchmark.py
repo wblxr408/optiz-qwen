@@ -25,13 +25,6 @@ DEFAULT_DATASET_PATH = "./resources/eval_dataset/raw/mmbench_public/mmbench_dev_
 DEFAULT_MODEL_PATH = "./resources/model_weights/raw/Qwen3.5-2B"
 DEFAULT_OUTPUT_PATH = "./benchmarks/output/result_public.json"
 OFFICIAL_MAX_NEW_TOKENS = 256
-KIVI_ENV_KEYS = (
-    "OPTIZ_QWEN_KIVI_KV_CACHE",
-    "OPTIZ_QWEN_KIVI_K_BITS",
-    "OPTIZ_QWEN_KIVI_V_BITS",
-    "OPTIZ_QWEN_KIVI_GROUP_SIZE",
-    "OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH",
-)
 KV_CHAIN_ENV_KEYS = (
     "OPTIZ_QWEN_KV_CHAIN_ENABLED",
     "OPTIZ_QWEN_KV_CHAIN",
@@ -106,16 +99,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tome-r", type=int, default=1)
     parser.add_argument("--tome-proportional-attention", action="store_true")
     parser.add_argument(
-        "--enable-kivi-kv-cache",
+        "--enable-kv-chain",
         action="store_true",
-        help="Enable the local Qwen3.5 KIVI KV-cache adapter for this run.",
+        help="Enable the retained deferred packed-KV experimental chain.",
     )
-    parser.add_argument("--kivi-k-bits", type=int, default=2)
-    parser.add_argument("--kivi-v-bits", type=int, default=2)
-    parser.add_argument("--kivi-group-size", type=int, default=32)
-    parser.add_argument("--kivi-residual-length", type=int, default=32)
-    parser.add_argument("--enable-kv-chain", action="store_true")
-    parser.add_argument("--kv-chain", type=str, default="qserve_kv")
+    parser.add_argument(
+        "--kv-chain",
+        choices=["qserve_deferred_split_fused_kv"],
+        default="qserve_deferred_split_fused_kv",
+    )
     parser.add_argument("--kv-chain-k-bits", type=int, default=4)
     parser.add_argument("--kv-chain-v-bits", type=int, default=4)
     parser.add_argument("--kv-chain-group-size", type=int, default=32)
@@ -269,34 +261,19 @@ def validate_public_result(
 
 
 @contextmanager
-def kivi_cli_environment(args: argparse.Namespace):
-    previous = {key: os.environ.get(key) for key in KIVI_ENV_KEYS}
-    if args.enable_kivi_kv_cache:
-        os.environ["OPTIZ_QWEN_KIVI_KV_CACHE"] = "1"
-        os.environ["OPTIZ_QWEN_KIVI_K_BITS"] = str(args.kivi_k_bits)
-        os.environ["OPTIZ_QWEN_KIVI_V_BITS"] = str(args.kivi_v_bits)
-        os.environ["OPTIZ_QWEN_KIVI_GROUP_SIZE"] = str(args.kivi_group_size)
-        os.environ["OPTIZ_QWEN_KIVI_RESIDUAL_LENGTH"] = str(args.kivi_residual_length)
-    else:
-        for key in KIVI_ENV_KEYS:
-            os.environ.pop(key, None)
-    try:
-        yield
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-
-@contextmanager
 def kv_chain_cli_environment(args: argparse.Namespace):
     previous = {key: os.environ.get(key) for key in KV_CHAIN_ENV_KEYS}
     if getattr(args, "enable_kv_chain", False):
+        requested_chain = str(
+            getattr(args, "kv_chain", "qserve_deferred_split_fused_kv")
+        ).strip().lower()
+        if requested_chain != "qserve_deferred_split_fused_kv":
+            raise ValueError(
+                "Only qserve_deferred_split_fused_kv is retained for KV experiments."
+            )
         os.environ["OPTIZ_QWEN_KV_CHAIN_ENABLED"] = "1"
-        os.environ["OPTIZ_QWEN_KV_CHAIN"] = str(getattr(args, "kv_chain", "qserve_kv"))
-        os.environ["OPTIZ_QWEN_KV_CHAIN_K_BITS"] = str(getattr(args, "kv_chain_k_bits", 2))
+        os.environ["OPTIZ_QWEN_KV_CHAIN"] = "qserve_deferred_split_fused_kv"
+        os.environ["OPTIZ_QWEN_KV_CHAIN_K_BITS"] = str(getattr(args, "kv_chain_k_bits", 4))
         os.environ["OPTIZ_QWEN_KV_CHAIN_V_BITS"] = str(getattr(args, "kv_chain_v_bits", 4))
         os.environ["OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE"] = str(getattr(args, "kv_chain_group_size", 32))
         os.environ["OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH"] = str(getattr(args, "kv_chain_residual_length", 32))
@@ -368,6 +345,11 @@ def tome_cli_environment(args: argparse.Namespace):
 
 def run_benchmark(args: argparse.Namespace) -> dict:
     benchmark_start = time.perf_counter()
+    if getattr(args, "enable_kv_chain", False) and getattr(args, "generation_runner", "generate") != "greedy":
+        raise ValueError(
+            "qserve_deferred_split_fused_kv requires --generation-runner greedy; "
+            "the native generate runner cannot install the fused decode path after prefill."
+        )
     random.seed(args.seed)
     try:
         import numpy as np
@@ -398,16 +380,13 @@ def run_benchmark(args: argparse.Namespace) -> dict:
     if not samples:
         raise ValueError(f"No samples loaded from {dataset_path}")
 
-    kivi_env_enabled = False
     kv_chain_env_enabled = False
     with (
-        kivi_cli_environment(args),
         kv_chain_cli_environment(args),
         runner_cli_environment(args),
         visual_cli_environment(args),
         tome_cli_environment(args),
     ):
-        kivi_env_enabled = os.environ.get("OPTIZ_QWEN_KIVI_KV_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}
         kv_chain_env_enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
         model = VLMModel(args.model_path, backend=args.backend, device=args.device)
 
@@ -506,8 +485,6 @@ def run_benchmark(args: argparse.Namespace) -> dict:
                 if getattr(args, "enable_tome", False)
                 else False
             ),
-            "kivi_kv_cache_requested_by_cli": bool(args.enable_kivi_kv_cache),
-            "kivi_kv_cache_enabled_by_env": kivi_env_enabled,
             "kv_chain_requested_by_cli": bool(getattr(args, "enable_kv_chain", False)),
             "kv_chain_enabled_by_env": kv_chain_env_enabled,
             "kv_chain_name": getattr(args, "kv_chain", None) if kv_chain_env_enabled else None,

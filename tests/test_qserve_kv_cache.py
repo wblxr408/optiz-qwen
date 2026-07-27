@@ -1,8 +1,21 @@
 from __future__ import annotations
 
+import pytest
 import torch
+from torch.nn import functional as F
 
-from optiz_qwen.compression import QServeAttentionLayer, QServeFusedAttentionLayer, QServeKvCache, QServeKvConfig
+from optiz_qwen.compression import (
+    QServeDeferredSplitFusedAttentionLayer,
+    QServeDeferredSplitFusedKvCache,
+    QServeKvConfig,
+    build_qserve_deferred_split_fused_kv_cache,
+)
+from optiz_qwen.compression.qserve_kv_cache import (
+    QServeAttentionLayer,
+)
+from optiz_qwen.scheduling import build_kv_chain
+from optiz_qwen.kernels.qwen35_fused_attention import _qserve_fused_forward
+from optiz_qwen.kernels.qserve_int4_attention import qserve_int4_split_decode_attention
 
 
 class MinimalQwenConfig:
@@ -42,29 +55,102 @@ def test_qserve_attention_layer_streams_decode_and_preserves_dtype() -> None:
     assert out_values.shape[-2] == 17
 
 
-def test_qserve_cache_only_replaces_full_attention_layers() -> None:
-    cache = QServeKvCache(MinimalQwenConfig(), QServeKvConfig(k_bits=4, v_bits=4, group_size=16, residual_length=16))
-
-    assert cache.full_attention_layers == (1,)
-    assert isinstance(cache.layers[1], QServeAttentionLayer)
-    assert cache.layers[0].__class__.__name__ != "QServeAttentionLayer"
-    assert cache.report().implementation == "qserve_kv4_local"
-
-
-def test_fused_layer_keeps_decode_output_packed_until_attention() -> None:
-    layer = QServeFusedAttentionLayer(
+def test_deferred_split_cache_preserves_prefill_dense_until_decode() -> None:
+    layer = QServeDeferredSplitFusedAttentionLayer(
         QServeKvConfig(k_bits=4, v_bits=4, group_size=16, residual_length=16)
     )
     prefill_keys = torch.randn(1, 2, 16, 16)
     prefill_values = torch.randn_like(prefill_keys)
-    decode_key = torch.randn(1, 2, 1, 16)
-    decode_value = torch.randn_like(decode_key)
     layer.update(prefill_keys, prefill_values)
 
-    returned_keys, returned_values = layer.update(decode_key, decode_value)
+    assert layer._deferred_prefill is True
+    assert layer._key_code is None
+    assert torch.equal(layer.materialize()[0], prefill_keys)
 
-    assert returned_keys.shape[-2] == 1
-    assert returned_values.shape[-2] == 1
-    materialized_keys, materialized_values = layer.materialize()
-    assert materialized_keys.shape[-2] == 17
-    assert materialized_values.shape[-2] == 17
+    decode_key = torch.randn(1, 2, 1, 16)
+    decode_value = torch.randn_like(decode_key)
+    layer.update(decode_key, decode_value)
+
+    assert layer._deferred_prefill is False
+    assert layer._key_code is not None
+    assert layer.get_seq_length() == 17
+
+
+def test_deferred_split_layer_can_adopt_native_prefill_tensors() -> None:
+    layer = QServeDeferredSplitFusedAttentionLayer(
+        QServeKvConfig(k_bits=4, v_bits=4, group_size=16, residual_length=16)
+    )
+    prefill_keys = torch.randn(1, 2, 16, 16)
+    prefill_values = torch.randn_like(prefill_keys)
+    layer.adopt_prefill(prefill_keys, prefill_values)
+
+    assert layer._deferred_prefill is True
+    assert layer.get_seq_length() == 16
+    assert torch.equal(layer.materialize()[1], prefill_values)
+
+
+def test_deferred_split_chain_reports_its_runtime_implementation() -> None:
+    cache, report = build_kv_chain(
+        chain_name="qserve_deferred_split_fused_kv",
+        model_config=MinimalQwenConfig(),
+        enabled=True,
+        qserve_config=QServeKvConfig(k_bits=4, v_bits=4, group_size=16, residual_length=16),
+    )
+
+    assert isinstance(cache, QServeDeferredSplitFusedKvCache)
+    assert report.implementation == "qserve_triton_int4_deferred_split_decode"
+
+
+def test_removed_kv_chain_names_are_rejected() -> None:
+    with pytest.raises(ValueError, match="Only qserve_deferred_split_fused_kv is retained"):
+        build_kv_chain(
+            chain_name="qserve_fused_kv",
+            model_config=MinimalQwenConfig(),
+            enabled=True,
+        )
+
+
+def test_fused_attention_delegates_prefill_to_the_native_forward() -> None:
+    class Attention:
+        def __init__(self) -> None:
+            self._optiz_original_forward = self.native_forward
+            self.calls = 0
+
+        def native_forward(self, hidden_states, **kwargs):
+            self.calls += 1
+            return hidden_states, kwargs
+
+    attention = Attention()
+    hidden_states = torch.randn(1, 2, 16)
+    result = _qserve_fused_forward(
+        attention,
+        hidden_states,
+        position_embeddings=(torch.empty(0), torch.empty(0)),
+        attention_mask=None,
+    )
+
+    assert attention.calls == 1
+    assert result[0] is hidden_states
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA Triton runtime")
+def test_split_kernel_matches_eager_attention_for_the_same_quantized_kv() -> None:
+    torch.manual_seed(31)
+    layer = QServeAttentionLayer(
+        QServeKvConfig(k_bits=4, v_bits=4, group_size=32, residual_length=32)
+    )
+    keys = torch.randn(1, 2, 32, 32, device="cuda", dtype=torch.float16)
+    values = torch.randn_like(keys)
+    query = torch.randn(1, 8, 1, 32, device="cuda", dtype=torch.float16)
+    layer.update(keys, values)
+
+    actual = qserve_int4_split_decode_attention(query, layer, scaling=1 / (32**0.5))
+    dense_keys, dense_values = layer.materialize()
+    expected = F.scaled_dot_product_attention(
+        query,
+        dense_keys.repeat_interleave(4, dim=1),
+        dense_values.repeat_interleave(4, dim=1),
+        is_causal=False,
+    ).transpose(1, 2)
+
+    torch.testing.assert_close(actual, expected, rtol=3e-3, atol=5e-4)

@@ -74,14 +74,15 @@ conda run -n optiz-qwen python -m pip install --force-reinstall -r configs/requi
 conda run -n optiz-qwen python benchmark_public.py --backend transformers --device cuda --num-samples 1
 ```
 
-KIVI KV-cache experiment example:
+Retained packed-KV experimental-chain example:
 
 ```bash
-python benchmark_public.py --backend transformers --device cuda --enable-kivi-kv-cache
+python benchmark_public.py --backend transformers --device cuda --generation-runner greedy --enable-kv-chain
 ```
 
-The baseline remains KIVI-off by default.  KIVI can also be enabled with
-`OPTIZ_QWEN_KIVI_KV_CACHE=1` for compatibility with earlier scripts.
+The baseline remains KV-chain-off by default. This retained chain is numerically
+validated but did not produce a meaningful short-context win on the local CUDA
+device, so it is reserved for long-context and target-PPU investigation.
 
 ## Optional D-direction AWQ/GDN experiments
 

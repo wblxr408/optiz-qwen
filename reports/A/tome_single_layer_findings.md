@@ -41,7 +41,7 @@
 - 正式对比：20 条样本
 - Baseline：ToMe 关闭
 - Candidate：视觉第 12 层执行 ToMe，`r=32`
-- KIVI、KV Chain、视觉输入缩放：关闭
+- KV Chain、视觉输入缩放：关闭
 
 本实验将生成长度设为 1，是为了突出视觉编码器和 prefill 的 TTFT 变化。因此报告不解释该配置下的 token/s；单 Token 运行的吞吐分母过小，不代表完整 decode 吞吐。
 

@@ -6,11 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from optiz_qwen.compression import (
-    KiviConfig,
     QServeKvConfig,
-    build_qwen35_kivi_cache,
-    build_qserve_fused_kv_cache,
-    build_qserve_kv_cache,
+    build_qserve_deferred_split_fused_kv_cache,
 )
 from optiz_qwen.scheduling.prefill_decode import PrefillDecodeStats
 
@@ -33,7 +30,6 @@ def build_kv_chain(
     chain_name: str,
     model_config: Any,
     enabled: bool,
-    kivi_config: KiviConfig | None = None,
     qserve_config: QServeKvConfig | None = None,
 ) -> tuple[Any | None, KVChainReport]:
     """Build the selected KV chain object and a compact report."""
@@ -42,9 +38,9 @@ def build_kv_chain(
     if not enabled:
         return None, KVChainReport(chain_name=normalized, enabled=False)
 
-    if normalized == "legacy_kivi":
-        cfg = kivi_config or KiviConfig()
-        cache = build_qwen35_kivi_cache(model_config, cfg)
+    if normalized == "qserve_deferred_split_fused_kv":
+        cfg = qserve_config or QServeKvConfig()
+        cache = build_qserve_deferred_split_fused_kv_cache(model_config, cfg)
         return cache, KVChainReport(
             chain_name=normalized,
             enabled=True,
@@ -52,34 +48,10 @@ def build_kv_chain(
             v_bits=cfg.v_bits,
             group_size=cfg.group_size,
             residual_length=cfg.residual_length,
-            implementation="legacy_kivi",
+            implementation="qserve_triton_int4_deferred_split_decode",
         )
 
-    if normalized == "qserve_kv":
-        cfg = qserve_config or QServeKvConfig()
-        cache = build_qserve_kv_cache(model_config, cfg)
-        report = KVChainReport(
-            chain_name=normalized,
-            enabled=True,
-            k_bits=cfg.k_bits,
-            v_bits=cfg.v_bits,
-            group_size=cfg.group_size,
-            residual_length=cfg.residual_length,
-            implementation="qserve_kv4_local",
-        )
-        return cache, report
-
-    if normalized == "qserve_fused_kv":
-        cfg = qserve_config or QServeKvConfig()
-        cache = build_qserve_fused_kv_cache(model_config, cfg)
-        return cache, KVChainReport(
-            chain_name=normalized,
-            enabled=True,
-            k_bits=cfg.k_bits,
-            v_bits=cfg.v_bits,
-            group_size=cfg.group_size,
-            residual_length=cfg.residual_length,
-            implementation="qserve_triton_int4_decode",
-        )
-
-    raise ValueError(f"unsupported KV chain: {chain_name}")
+    raise ValueError(
+        "unsupported KV chain: "
+        f"{chain_name}. Only qserve_deferred_split_fused_kv is retained."
+    )

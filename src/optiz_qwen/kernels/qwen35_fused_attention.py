@@ -9,6 +9,7 @@ import torch
 
 from optiz_qwen.kernels.qserve_int4_attention import (
     qserve_int4_decode_attention,
+    qserve_int4_split_decode_attention,
     triton_int4_decode_available,
 )
 
@@ -21,6 +22,21 @@ def _qserve_fused_forward(
     past_key_values: Any | None = None,
     **kwargs,
 ):
+    # Packed-KV acceleration only applies to one-token decode.  Delegating
+    # prefill to the original module avoids a second Python-level attention
+    # implementation on the TTFT-critical path.
+    if hidden_states.shape[1] != 1:
+        original_forward = getattr(self, "_optiz_original_forward", None)
+        if original_forward is None:
+            raise RuntimeError("qserve fused attention lost the native Qwen3.5 forward method.")
+        return original_forward(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
     from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb, eager_attention_forward
 
@@ -49,7 +65,10 @@ def _qserve_fused_forward(
         )
 
     if fused_decode:
-        attn_output = qserve_int4_decode_attention(query_states, cache_layer, scaling=self.scaling)
+        if getattr(past_key_values, "attention_backend", "triton_int4_decode") == "triton_int4_split_decode":
+            attn_output = qserve_int4_split_decode_attention(query_states, cache_layer, scaling=self.scaling)
+        else:
+            attn_output = qserve_int4_decode_attention(query_states, cache_layer, scaling=self.scaling)
         attn_weights = None
         past_key_values.kernel_calls += 1
     else:

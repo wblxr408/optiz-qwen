@@ -95,3 +95,47 @@ def test_run_greedy_prefill_decode_passes_prepared_position_ids_to_decode() -> N
 
     assert model.prepared_position_ids is not None
     assert torch.equal(model.prepared_position_ids, torch.tensor([[[1, 2, 3, 4]]], dtype=torch.long))
+
+
+class FakeDeferredCache:
+    defer_prefill_cache_injection = True
+
+    def __init__(self) -> None:
+        self.adopted = None
+
+    def adopt_native_prefill_cache(self, native_cache) -> None:
+        self.adopted = native_cache
+
+
+def test_run_greedy_prefill_decode_defers_custom_cache_until_after_native_prefill() -> None:
+    model = FakeGreedyModel()
+    cache = FakeDeferredCache()
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+    }
+
+    run_greedy_prefill_decode(model, inputs, max_new_tokens=2, tokenizer=object(), kv_cache=cache)
+
+    assert "past_key_values" not in model.calls[0]
+    assert cache.adopted == {"step": 3}
+    assert model.calls[1]["past_key_values"] is cache
+
+
+def test_run_greedy_prefill_decode_runs_post_prefill_callback_before_decode() -> None:
+    model = FakeGreedyModel()
+    callback_state = {"calls": 0}
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+    }
+
+    run_greedy_prefill_decode(
+        model,
+        inputs,
+        max_new_tokens=2,
+        tokenizer=object(),
+        post_prefill_callback=lambda: callback_state.__setitem__("calls", callback_state["calls"] + 1),
+    )
+
+    assert callback_state["calls"] == 1
