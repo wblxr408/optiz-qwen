@@ -8,6 +8,23 @@ This directory is reserved for executable workflow entrypoints such as:
 - data-preparation helpers
 - benchmark collection
 
+## A-direction visual-token experiments
+
+The ToMe experiment entrypoints share the explicit `--matching` switch:
+
+- `tome`: fixed bipartite ToMe matching, which remains the default;
+- `pitome`: energy-based PiToMe matching;
+- `dtome`: threshold-based dynamic matching.
+
+`calibrate_dtome_threshold.py` builds a scalar threshold and a visual-length
+bucketed schedule from a generic image directory. `benchmark_tome_paired.py`
+and `profile_tome_visual_blocks.py` accept that calibration JSON through
+`--threshold-calibration`. `plot_dtome_allocation.py` visualizes the resulting
+per-sample merge allocation and paired TTFT changes.
+
+These strategies are experimental and default off in the DNDX benchmark.
+Measured conclusions and figures are under `reports/A/`.
+
 ## D-direction AWQ/GDN switches
 
 `run_v11_cuda_matrix.py` has two explicit, default-off switches:

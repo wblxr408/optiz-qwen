@@ -60,6 +60,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-samples", type=int, default=2)
     parser.add_argument("--layer", type=int, default=12)
     parser.add_argument("--r", type=int, default=32)
+    parser.add_argument("--matching", choices=["tome", "pitome", "dtome"], default="tome")
+    parser.add_argument("--threshold", type=float, default=None)
+    parser.add_argument("--threshold-calibration", type=Path, default=None)
+    parser.add_argument("--proportional-attention", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -145,6 +149,14 @@ def main() -> None:
     args = parse_args()
     if args.num_samples <= 0 or args.warmup_samples < 0:
         raise ValueError("num-samples must be positive and warmup-samples non-negative.")
+    if args.threshold is not None and args.threshold_calibration is not None:
+        raise ValueError("Use either --threshold or --threshold-calibration, not both.")
+    if args.threshold_calibration is not None:
+        calibration = json.loads(args.threshold_calibration.read_text(encoding="utf-8"))
+        args.threshold = tuple(
+            (entry["source_edge_limit"], entry["threshold"])
+            for entry in calibration["threshold_schedule"]
+        )
     device = torch.device(args.device)
     if device.type == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("MPS was requested but is unavailable.")
@@ -163,7 +175,16 @@ def main() -> None:
     run_samples(model, processor, warmup_rows, device)
     baseline_timers, baseline_visual_timer = timed_run(model, processor, sample_rows, device)
 
-    install_qwen35_tome(model, Qwen35TomeConfig(layer=args.layer, r=args.r))
+    install_qwen35_tome(
+        model,
+        Qwen35TomeConfig(
+            layer=args.layer,
+            r=args.r,
+            matching=args.matching,
+            threshold=args.threshold,
+            proportional_attention=args.proportional_attention,
+        ),
+    )
     run_samples(model, processor, warmup_rows, device)
     tome_timers, tome_visual_timer = timed_run(model, processor, sample_rows, device)
 
@@ -204,6 +225,14 @@ def main() -> None:
         "warmup_samples": args.warmup_samples,
         "tome_layer": args.layer,
         "tome_r": args.r,
+        "tome_matching": args.matching,
+        "tome_threshold": args.threshold,
+        "tome_threshold_calibration": (
+            str(args.threshold_calibration.resolve())
+            if args.threshold_calibration is not None
+            else None
+        ),
+        "tome_proportional_attention": args.proportional_attention,
         "visual_summary": visual_summary,
         "layers": layers,
     }

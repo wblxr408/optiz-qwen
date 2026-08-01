@@ -25,6 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--r", type=int, default=32)
+    parser.add_argument("--matching", choices=["tome", "pitome", "dtome"], default="tome")
+    parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -53,9 +55,20 @@ def main() -> None:
     for token_count in TOKEN_COUNTS:
         inputs = make_inputs(token_count, device)
         for _ in range(args.warmup):
-            merge_single_visual_sample(*inputs, r=args.r)
+            merge_single_visual_sample(
+                *inputs,
+                r=args.r,
+                matching=args.matching,
+                threshold=args.threshold,
+            )
         samples = [
-            merge_single_visual_sample(*inputs, r=args.r, profile=True).timings_ms
+            merge_single_visual_sample(
+                *inputs,
+                r=args.r,
+                matching=args.matching,
+                threshold=args.threshold,
+                profile=True,
+            ).timings_ms
             for _ in range(args.repeats)
         ]
         if any(sample is None for sample in samples):
@@ -82,6 +95,8 @@ def main() -> None:
         "dtype": "bfloat16" if device.type != "cpu" else "float32",
         "warmup": args.warmup,
         "repeats": args.repeats,
+        "matching": args.matching,
+        "threshold": args.threshold,
         "results": results,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

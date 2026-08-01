@@ -144,9 +144,15 @@ def main() -> None:
     optimization = candidate.get("optimization", {})
     layer = optimization.get("tome_layer", 12)
     r = optimization.get("tome_r", 32)
+    matching = optimization.get("tome_matching", "tome")
+    method = {
+        "tome": "ToMe",
+        "pitome": "PiToMe",
+        "dtome": "DToMe",
+    }.get(matching, matching)
     proportional = " + proportional" if optimization.get("tome_proportional_attention") else ""
     fig.suptitle(
-        f"Qwen3.5-2B ToMe L{layer} R{r}{proportional}, "
+        f"Qwen3.5-2B {method} L{layer} R{r}{proportional}, "
         f"MMBench {dataset_name}{len(question_ids)}{offset_label} on MPS",
         fontsize=14,
         y=0.995,

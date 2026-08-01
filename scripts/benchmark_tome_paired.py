@@ -46,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--layer", type=int, default=12)
     parser.add_argument("--r", type=int, default=32)
+    parser.add_argument("--matching", choices=["tome", "pitome", "dtome"], default="tome")
+    parser.add_argument("--threshold", type=float, default=None)
+    parser.add_argument("--threshold-calibration", type=Path, default=None)
     parser.add_argument("--proportional-attention", action="store_true")
     parser.add_argument("--output-prefix", type=Path, required=True)
     return parser.parse_args()
@@ -106,6 +109,13 @@ def build_payload(mode: str, rows: list[dict], args: argparse.Namespace) -> dict
             "paired_alternating_order": True,
             "tome_layer": args.layer if mode == "tome" else None,
             "tome_r": args.r if mode == "tome" else None,
+            "tome_matching": args.matching if mode == "tome" else None,
+            "tome_threshold": args.threshold if mode == "tome" else None,
+            "tome_threshold_calibration": (
+                str(args.threshold_calibration.resolve())
+                if mode == "tome" and args.threshold_calibration is not None
+                else None
+            ),
             "tome_proportional_attention": args.proportional_attention if mode == "tome" else False,
         },
         "performance": {
@@ -129,6 +139,14 @@ def main() -> None:
     args = parse_args()
     if args.num_samples <= 0 or args.warmup_samples < 0 or args.sample_offset < 0:
         raise ValueError("num-samples must be positive; warmup-samples and sample-offset must be non-negative.")
+    if args.threshold is not None and args.threshold_calibration is not None:
+        raise ValueError("Use either --threshold or --threshold-calibration, not both.")
+    if args.threshold_calibration is not None:
+        calibration = json.loads(args.threshold_calibration.read_text(encoding="utf-8"))
+        args.threshold = tuple(
+            (entry["source_edge_limit"], entry["threshold"])
+            for entry in calibration["threshold_schedule"]
+        )
     loaded_samples = load_mmbench_tsv(
         Path(args.dataset_path),
         limit=args.sample_offset + args.num_samples,
@@ -141,6 +159,8 @@ def main() -> None:
     config = Qwen35TomeConfig(
         layer=args.layer,
         r=args.r,
+        matching=args.matching,
+        threshold=args.threshold,
         proportional_attention=args.proportional_attention,
     )
     install_qwen35_tome(model._model, config)
