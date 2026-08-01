@@ -7,6 +7,8 @@ import time
 
 import torch
 
+DToMeThreshold = float | tuple[tuple[int, float], ...]
+
 
 @dataclass(frozen=True)
 class TomeMergeResult:
@@ -27,6 +29,8 @@ def merge_visual_units(
     *,
     r: int,
     unit_size: int = 4,
+    matching: str = "tome",
+    threshold: DToMeThreshold | None = None,
 ) -> TomeMergeResult:
     """Merge ``r`` similar visual units per packed sample.
 
@@ -45,6 +49,8 @@ def merge_visual_units(
         boundaries=boundaries,
         r=r,
         unit_size=unit_size,
+        matching=matching,
+        threshold=threshold,
     )
 
 
@@ -55,6 +61,8 @@ def merge_single_visual_sample(
     *,
     r: int,
     unit_size: int = 4,
+    matching: str = "tome",
+    threshold: DToMeThreshold | None = None,
     profile: bool = False,
 ) -> TomeMergeResult:
     """Merge one visual sample without reading sequence metadata from its device."""
@@ -79,6 +87,8 @@ def merge_single_visual_sample(
         boundaries=[0, hidden_states.shape[0]],
         r=r,
         unit_size=unit_size,
+        matching=matching,
+        threshold=threshold,
         profile=profile,
     )
 
@@ -92,10 +102,13 @@ def _merge_visual_units(
     boundaries: list[int],
     r: int,
     unit_size: int,
+    matching: str,
+    threshold: DToMeThreshold | None,
     profile: bool = False,
 ) -> TomeMergeResult:
     if r < 0:
         raise ValueError("r must be non-negative.")
+    _validate_matching(matching, threshold)
 
     output_states: list[torch.Tensor] = []
     output_sizes: list[torch.Tensor] = []
@@ -121,7 +134,7 @@ def _merge_visual_units(
             output_lengths.append(output_lengths[-1] + end - start)
             continue
 
-        if r > min((unit_count + 1) // 2, unit_count // 2):
+        if matching != "dtome" and r > min((unit_count + 1) // 2, unit_count // 2):
             raise ValueError(
                 f"r={r} exceeds the bipartite matching capacity for a sample "
                 f"with {unit_count} visual units."
@@ -132,18 +145,21 @@ def _merge_visual_units(
         units = sample_states.reshape(unit_count, unit_size, -1)
         sizes = sample_sizes.reshape(unit_count, unit_size, 1)
         unit_metric = sample_metric.reshape(unit_count, unit_size, -1).mean(dim=1)
+        if matching == "dtome":
+            unit_metric = unit_metric.float()
         unit_metric = torch.nn.functional.normalize(unit_metric, dim=-1)
         _record_stage(timings_ms, "metric_preparation", stage_started, hidden_states.device)
 
         _synchronize(hidden_states.device, profile)
         stage_started = time.perf_counter()
-        even_units = torch.arange(0, unit_count, 2, device=hidden_states.device)
-        odd_units = torch.arange(1, unit_count, 2, device=hidden_states.device)
-        scores = unit_metric[even_units] @ unit_metric[odd_units].transpose(0, 1)
-        best_scores, best_destinations = scores.max(dim=1)
-        selected_even = best_scores.topk(r, largest=True, sorted=True).indices
-        sources = even_units[selected_even]
-        destinations = odd_units[best_destinations[selected_even]]
+        sources, destinations = _select_merge_pairs(
+            unit_metric,
+            r,
+            matching,
+            _resolve_dtome_threshold(threshold, (unit_count + 1) // 2)
+            if matching == "dtome"
+            else threshold,
+        )
         _record_stage(timings_ms, "bipartite_matching", stage_started, hidden_states.device)
 
         _synchronize(hidden_states.device, profile)
@@ -183,6 +199,97 @@ def _merge_visual_units(
         destination_unit_indices=torch.cat(destination_indices),
         timings_ms=_finish_result_timing(timings_ms, stage_started, hidden_states.device),
     )
+
+
+def _select_merge_pairs(
+    unit_metric: torch.Tensor,
+    r: int,
+    matching: str,
+    threshold: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if matching in {"tome", "dtome"}:
+        even_units = torch.arange(0, unit_metric.shape[0], 2, device=unit_metric.device)
+        odd_units = torch.arange(1, unit_metric.shape[0], 2, device=unit_metric.device)
+        scores = unit_metric[even_units] @ unit_metric[odd_units].transpose(0, 1)
+        best_scores, best_destinations = scores.max(dim=1)
+        if matching == "dtome":
+            selected_even = torch.nonzero(best_scores > threshold, as_tuple=False).flatten()
+            if selected_even.numel() == 0:
+                empty = torch.empty(0, dtype=torch.long, device=unit_metric.device)
+                return empty, empty
+            selected_even = selected_even[
+                best_scores[selected_even].argsort(descending=True)
+            ]
+            return even_units[selected_even], odd_units[best_destinations[selected_even]]
+        selected_even = best_scores.topk(r, largest=True, sorted=True).indices
+        return even_units[selected_even], odd_units[best_destinations[selected_even]]
+
+    similarities = unit_metric @ unit_metric.transpose(0, 1)
+    energy = torch.nn.functional.elu(similarities - 0.5).mean(dim=-1)
+    mergeable = energy.argsort(descending=True)[: 2 * r]
+    sources = mergeable[::2]
+    destination_candidates = mergeable[1::2]
+    scores = similarities[sources][:, destination_candidates]
+    destinations = destination_candidates[scores.argmax(dim=-1)]
+    return sources, destinations
+
+
+def visual_unit_matching_scores(
+    metric: torch.Tensor,
+    *,
+    unit_size: int = 4,
+) -> torch.Tensor:
+    """Return each source unit's best ToMe edge score for threshold calibration."""
+
+    if metric.ndim != 2 or not metric.is_floating_point():
+        raise ValueError("metric must be a floating-point tensor with shape [tokens, features].")
+    if unit_size <= 0 or metric.shape[0] % unit_size != 0:
+        raise ValueError("metric length must be divisible by a positive unit_size.")
+    unit_count = metric.shape[0] // unit_size
+    if unit_count < 2:
+        raise ValueError("threshold calibration requires at least two visual units.")
+    unit_metric = metric.float().reshape(unit_count, unit_size, -1).mean(dim=1)
+    unit_metric = torch.nn.functional.normalize(unit_metric, dim=-1)
+    even_units = unit_metric[::2]
+    odd_units = unit_metric[1::2]
+    return (even_units @ odd_units.transpose(0, 1)).max(dim=-1).values
+
+
+def _validate_matching(matching: str, threshold: DToMeThreshold | None) -> None:
+    if matching not in {"tome", "pitome", "dtome"}:
+        raise ValueError("matching must be 'tome', 'pitome', or 'dtome'.")
+    if matching == "dtome":
+        if threshold is None:
+            raise ValueError("dtome matching requires a threshold.")
+        if isinstance(threshold, tuple):
+            if not threshold:
+                raise ValueError("dtome threshold schedule must not be empty.")
+            previous_limit = 0
+            for source_limit, value in threshold:
+                if source_limit <= previous_limit or not -1.0 <= value <= 1.0:
+                    raise ValueError(
+                        "dtome threshold schedule requires increasing positive limits "
+                        "and thresholds in [-1, 1]."
+                    )
+                previous_limit = source_limit
+        elif not -1.0 <= threshold <= 1.0:
+            raise ValueError("dtome matching requires a threshold in [-1, 1].")
+    elif threshold is not None:
+        raise ValueError("threshold is only valid with dtome matching.")
+
+
+def _resolve_dtome_threshold(
+    threshold: DToMeThreshold | None,
+    source_count: int,
+) -> float:
+    if threshold is None:
+        raise RuntimeError("validated DToMe threshold is missing.")
+    if isinstance(threshold, float):
+        return threshold
+    for source_limit, value in threshold:
+        if source_count <= source_limit:
+            return value
+    return threshold[-1][1]
 
 
 def _record_stage(

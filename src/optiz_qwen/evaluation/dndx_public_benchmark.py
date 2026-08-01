@@ -46,6 +46,9 @@ TOME_ENV_KEYS = (
     "OPTIZ_QWEN_TOME_ENABLED",
     "OPTIZ_QWEN_TOME_LAYER",
     "OPTIZ_QWEN_TOME_R",
+    "OPTIZ_QWEN_TOME_MATCHING",
+    "OPTIZ_QWEN_TOME_THRESHOLD",
+    "OPTIZ_QWEN_TOME_THRESHOLD_SCHEDULE",
     "OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION",
 )
 
@@ -104,6 +107,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-tome", action="store_true")
     parser.add_argument("--tome-layer", type=int, default=12)
     parser.add_argument("--tome-r", type=int, default=1)
+    parser.add_argument("--tome-matching", choices=["tome", "pitome", "dtome"], default="tome")
+    parser.add_argument("--tome-threshold", type=float, default=None)
+    parser.add_argument("--tome-threshold-calibration", type=str, default=None)
     parser.add_argument("--tome-proportional-attention", action="store_true")
     parser.add_argument(
         "--enable-kivi-kv-cache",
@@ -350,6 +356,26 @@ def tome_cli_environment(args: argparse.Namespace):
         os.environ["OPTIZ_QWEN_TOME_ENABLED"] = "1"
         os.environ["OPTIZ_QWEN_TOME_LAYER"] = str(getattr(args, "tome_layer", 12))
         os.environ["OPTIZ_QWEN_TOME_R"] = str(getattr(args, "tome_r", 1))
+        os.environ["OPTIZ_QWEN_TOME_MATCHING"] = str(getattr(args, "tome_matching", "tome"))
+        threshold = getattr(args, "tome_threshold", None)
+        calibration_path = getattr(args, "tome_threshold_calibration", None)
+        if threshold is not None and calibration_path is not None:
+            raise ValueError(
+                "Use either --tome-threshold or --tome-threshold-calibration, not both."
+            )
+        if threshold is not None:
+            os.environ["OPTIZ_QWEN_TOME_THRESHOLD"] = str(threshold)
+        else:
+            os.environ.pop("OPTIZ_QWEN_TOME_THRESHOLD", None)
+        if calibration_path is not None:
+            calibration = json.loads(Path(calibration_path).read_text(encoding="utf-8"))
+            schedule = [
+                [entry["source_edge_limit"], entry["threshold"]]
+                for entry in calibration["threshold_schedule"]
+            ]
+            os.environ["OPTIZ_QWEN_TOME_THRESHOLD_SCHEDULE"] = json.dumps(schedule)
+        else:
+            os.environ.pop("OPTIZ_QWEN_TOME_THRESHOLD_SCHEDULE", None)
         os.environ["OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION"] = (
             "1" if getattr(args, "tome_proportional_attention", False) else "0"
         )
@@ -501,6 +527,21 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "tome_enabled": bool(getattr(args, "enable_tome", False)),
             "tome_layer": getattr(args, "tome_layer", None) if getattr(args, "enable_tome", False) else None,
             "tome_r": getattr(args, "tome_r", None) if getattr(args, "enable_tome", False) else None,
+            "tome_matching": (
+                getattr(args, "tome_matching", "tome")
+                if getattr(args, "enable_tome", False)
+                else None
+            ),
+            "tome_threshold": (
+                getattr(args, "tome_threshold", None)
+                if getattr(args, "enable_tome", False)
+                else None
+            ),
+            "tome_threshold_calibration": (
+                getattr(args, "tome_threshold_calibration", None)
+                if getattr(args, "enable_tome", False)
+                else None
+            ),
             "tome_proportional_attention": (
                 bool(getattr(args, "tome_proportional_attention", False))
                 if getattr(args, "enable_tome", False)

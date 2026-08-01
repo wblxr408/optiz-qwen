@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from optiz_qwen.compression.tome import merge_single_visual_sample, merge_visual_units
+from optiz_qwen.compression.tome import (
+    merge_single_visual_sample,
+    merge_visual_units,
+    visual_unit_matching_scores,
+)
 
 
 def make_inputs(unit_values: list[float], boundaries: list[int] | None = None):
@@ -57,6 +61,95 @@ def test_weighted_merge_conserves_token_size() -> None:
     assert torch.allclose(result.hidden_states, torch.full((4, 1), 0.05))
     assert torch.equal(result.token_sizes, torch.full((4, 1), 4.0))
     assert result.token_sizes.sum() == token_sizes.sum()
+
+
+def test_pitome_protects_isolated_units() -> None:
+    unit_metrics = torch.tensor(
+        [
+            [1.00, 0.00],
+            [0.99, 0.01],
+            [0.98, -0.02],
+            [0.97, 0.03],
+            [0.00, 1.00],
+            [-1.00, 0.00],
+        ]
+    )
+    metric = unit_metrics.repeat_interleave(4, dim=0)
+    hidden_states = torch.arange(24, dtype=torch.float32).reshape(-1, 1)
+    token_sizes = torch.ones(24, 1)
+
+    result = merge_single_visual_sample(
+        hidden_states,
+        metric,
+        token_sizes,
+        r=2,
+        matching="pitome",
+    )
+
+    involved = set(result.source_unit_indices.tolist() + result.destination_unit_indices.tolist())
+    assert 4 not in involved
+    assert 5 not in involved
+    assert result.hidden_states.shape == (16, 1)
+    assert result.token_sizes.sum() == token_sizes.sum()
+
+
+def test_dtome_uses_threshold_to_choose_sample_specific_r() -> None:
+    unit_metrics = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.99, 0.01],
+            [0.0, 1.0],
+            [0.8, 0.6],
+        ]
+    )
+    metric = unit_metrics.repeat_interleave(4, dim=0)
+    hidden_states = torch.arange(16, dtype=torch.float32).reshape(-1, 1)
+    token_sizes = torch.ones(16, 1)
+
+    result = merge_single_visual_sample(
+        hidden_states,
+        metric,
+        token_sizes,
+        r=1,
+        matching="dtome",
+        threshold=0.95,
+    )
+
+    assert result.source_unit_indices.tolist() == [0]
+    assert result.destination_unit_indices.tolist() == [1]
+    assert result.hidden_states.shape == (12, 1)
+
+
+def test_dtome_can_keep_every_unit() -> None:
+    inputs = make_inputs([0.0, 0.1, 0.9, 1.0])
+
+    result = merge_visual_units(*inputs, r=1, matching="dtome", threshold=1.0)
+
+    assert torch.equal(result.hidden_states, inputs[0])
+    assert result.source_unit_indices.numel() == 0
+
+
+def test_dtome_threshold_schedule_uses_source_edge_count() -> None:
+    inputs = make_inputs([0.0, 0.1, 0.9, 1.0])
+
+    result = merge_visual_units(
+        *inputs,
+        r=1,
+        matching="dtome",
+        threshold=((1, 1.0), (2, 0.9)),
+    )
+
+    assert result.source_unit_indices.numel() == 2
+
+
+def test_visual_unit_matching_scores_match_dtome_edges() -> None:
+    _, metric, _, _ = make_inputs([0.0, 0.1, 0.9, 1.0])
+
+    scores = visual_unit_matching_scores(metric)
+
+    assert scores.shape == (2,)
+    assert torch.all(scores <= 1.0)
+    assert torch.all(scores >= -1.0)
 
 
 def test_packed_samples_are_matched_independently() -> None:
@@ -146,3 +239,26 @@ def test_rejects_r_above_matching_capacity() -> None:
 
     with pytest.raises(ValueError, match="capacity"):
         merge_visual_units(*inputs, r=2)
+
+
+def test_rejects_unknown_matching_strategy() -> None:
+    inputs = make_inputs([0.0, 0.1])
+
+    with pytest.raises(ValueError, match="matching"):
+        merge_visual_units(*inputs, r=1, matching="unknown")
+
+
+def test_rejects_invalid_dtome_threshold_usage() -> None:
+    inputs = make_inputs([0.0, 0.1])
+
+    with pytest.raises(ValueError, match="requires"):
+        merge_visual_units(*inputs, r=1, matching="dtome")
+    with pytest.raises(ValueError, match="only valid"):
+        merge_visual_units(*inputs, r=1, matching="tome", threshold=0.5)
+    with pytest.raises(ValueError, match="schedule"):
+        merge_visual_units(
+            *inputs,
+            r=1,
+            matching="dtome",
+            threshold=((2, 0.5), (1, 0.6)),
+        )

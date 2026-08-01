@@ -173,13 +173,52 @@ def test_tome_cli_environment_is_explicit_and_scoped(monkeypatch) -> None:
         enable_tome=True,
         tome_layer=8,
         tome_r=2,
+        tome_matching="pitome",
+        tome_threshold=None,
         tome_proportional_attention=True,
     )
     with tome_cli_environment(enabled_args):
         assert os.environ["OPTIZ_QWEN_TOME_ENABLED"] == "1"
         assert os.environ["OPTIZ_QWEN_TOME_LAYER"] == "8"
         assert os.environ["OPTIZ_QWEN_TOME_R"] == "2"
+        assert os.environ["OPTIZ_QWEN_TOME_MATCHING"] == "pitome"
         assert os.environ["OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION"] == "1"
+
+
+def test_tome_cli_environment_loads_threshold_schedule(monkeypatch, tmp_path) -> None:
+    import json
+    import os
+
+    calibration_path = tmp_path / "calibration.json"
+    calibration_path.write_text(
+        json.dumps(
+            {
+                "threshold_schedule": [
+                    {"source_edge_limit": 48, "threshold": 0.84},
+                    {"source_edge_limit": 96, "threshold": 0.91},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = Namespace(
+        enable_tome=True,
+        tome_layer=16,
+        tome_r=32,
+        tome_matching="dtome",
+        tome_threshold=None,
+        tome_threshold_calibration=str(calibration_path),
+        tome_proportional_attention=True,
+    )
+
+    with tome_cli_environment(args):
+        assert json.loads(os.environ["OPTIZ_QWEN_TOME_THRESHOLD_SCHEDULE"]) == [
+            [48, 0.84],
+            [96, 0.91],
+        ]
+        assert "OPTIZ_QWEN_TOME_THRESHOLD" not in os.environ
+
+    assert "OPTIZ_QWEN_TOME_THRESHOLD_SCHEDULE" not in os.environ
 
 
 def test_stratified_sample_selection_is_balanced_and_reproducible() -> None:

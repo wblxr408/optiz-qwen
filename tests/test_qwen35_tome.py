@@ -150,6 +150,10 @@ def test_proportional_attention_weights_values_by_token_size() -> None:
         Qwen35TomeConfig(layer=2, r=1),
         Qwen35TomeConfig(layer=0, r=0),
         Qwen35TomeConfig(layer=0, r=1, unit_size=2),
+        Qwen35TomeConfig(layer=0, r=1, matching="unknown"),
+        Qwen35TomeConfig(layer=0, r=1, matching="dtome"),
+        Qwen35TomeConfig(layer=0, r=1, matching="dtome", threshold=2.0),
+        Qwen35TomeConfig(layer=0, r=1, matching="tome", threshold=0.5),
     ],
 )
 def test_rejects_invalid_adapter_config(config) -> None:
@@ -164,3 +168,53 @@ def test_rejects_duplicate_installation() -> None:
 
     with pytest.raises(RuntimeError, match="already installed"):
         install_qwen35_tome(model, config)
+
+
+def test_runtime_reports_pitome_matching() -> None:
+    model = FakeModel()
+    install_qwen35_tome(model, Qwen35TomeConfig(layer=0, r=1, matching="pitome"))
+    hidden_states = torch.tensor([[0.0, 1.0]] * 4 + [[0.1, 0.9]] * 4)
+    positions = (torch.arange(16).reshape(8, 2), torch.arange(16).reshape(8, 2))
+    cu_seqlens = torch.tensor([0, 8], dtype=torch.int32)
+
+    model.model.visual.blocks[0](
+        hidden_states,
+        cu_seqlens=cu_seqlens,
+        position_embeddings=positions,
+    )
+
+    runtime = get_qwen35_tome_runtime(model)
+    assert runtime is not None
+    assert runtime["matching"] == "pitome"
+
+
+def test_dtome_zero_merge_keeps_following_layers_on_baseline_path() -> None:
+    model = FakeModel()
+    install_qwen35_tome(
+        model,
+        Qwen35TomeConfig(
+            layer=0,
+            r=1,
+            matching="dtome",
+            threshold=1.0,
+            proportional_attention=True,
+        ),
+    )
+    original = torch.tensor([[0.0, 1.0]] * 4 + [[0.1, 0.9]] * 4)
+    positions = (torch.arange(16).reshape(8, 2), torch.arange(16).reshape(8, 2))
+    cu_seqlens = torch.tensor([0, 8], dtype=torch.int32)
+
+    hidden_states = original
+    for block in model.model.visual.blocks:
+        hidden_states = block(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=positions,
+        )
+
+    runtime = get_qwen35_tome_runtime(model)
+    assert torch.equal(hidden_states, original * 4)
+    assert runtime is not None
+    assert runtime["merged_units"] == 0
+    assert runtime["compact_tokens"] == 8
+    assert model.model.visual.blocks[1].block.attn.seen_lengths == [8]

@@ -11,7 +11,11 @@ from torch import nn
 from torch.nn import functional as F
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb_vision
 
-from optiz_qwen.compression.tome import merge_single_visual_sample, merge_visual_units
+from optiz_qwen.compression.tome import (
+    DToMeThreshold,
+    merge_single_visual_sample,
+    merge_visual_units,
+)
 
 
 @dataclass(frozen=True)
@@ -20,6 +24,8 @@ class Qwen35TomeConfig:
     r: int
     unit_size: int = 4
     proportional_attention: bool = False
+    matching: str = "tome"
+    threshold: DToMeThreshold | None = None
 
     def validate(self, depth: int) -> None:
         if not 0 <= self.layer < depth:
@@ -28,6 +34,25 @@ class Qwen35TomeConfig:
             raise ValueError("ToMe r must be positive when the adapter is enabled.")
         if self.unit_size != 4:
             raise ValueError("Qwen3.5 ToMe requires unit_size=4 for its 2x2 PatchMerger.")
+        if self.matching not in {"tome", "pitome", "dtome"}:
+            raise ValueError("Qwen3.5 ToMe matching must be 'tome', 'pitome', or 'dtome'.")
+        if self.matching == "dtome":
+            if self.threshold is None:
+                raise ValueError("Qwen3.5 DToMe requires a threshold.")
+            if isinstance(self.threshold, tuple):
+                limits = [limit for limit, _value in self.threshold]
+                values = [value for _limit, value in self.threshold]
+                if (
+                    not limits
+                    or any(limit <= 0 for limit in limits)
+                    or limits != sorted(set(limits))
+                    or any(not -1.0 <= value <= 1.0 for value in values)
+                ):
+                    raise ValueError("Qwen3.5 DToMe threshold schedule is invalid.")
+            elif not -1.0 <= self.threshold <= 1.0:
+                raise ValueError("Qwen3.5 DToMe requires a threshold in [-1, 1].")
+        elif self.threshold is not None:
+            raise ValueError("Qwen3.5 ToMe threshold is only valid with dtome matching.")
 
 
 @dataclass(frozen=True)
@@ -41,6 +66,8 @@ class Qwen35TomeRuntime:
     merged_units: int
     merge_host_ms: float
     proportional_attention: bool
+    matching: str
+    threshold: DToMeThreshold | None
 
 
 class _TomeContext:
@@ -52,6 +79,7 @@ class _TomeContext:
         self.cu_seqlens: torch.Tensor | None = None
         self.runtime: Qwen35TomeRuntime | None = None
         self.restore_indices: torch.Tensor | None = None
+        self.compression_applied = False
 
     def reset(
         self,
@@ -69,6 +97,7 @@ class _TomeContext:
         self.cu_seqlens = cu_seqlens
         self.runtime = None
         self.restore_indices = None
+        self.compression_applied = False
 
 
 class Qwen35TomeBlock(nn.Module):
@@ -104,7 +133,11 @@ class Qwen35TomeBlock(nn.Module):
             raise RuntimeError("ToMe hidden-state and position lengths diverged.")
 
         if self.layer_index != self.context.config.layer:
-            if self.context.config.proportional_attention and self.layer_index > self.context.config.layer:
+            if (
+                self.context.compression_applied
+                and self.context.config.proportional_attention
+                and self.layer_index > self.context.config.layer
+            ):
                 token_sizes = self.context.token_sizes
                 if token_sizes is None:
                     raise RuntimeError("ToMe token sizes were not initialized.")
@@ -156,6 +189,8 @@ class Qwen35TomeBlock(nn.Module):
                 token_sizes,
                 r=self.context.config.r,
                 unit_size=self.context.config.unit_size,
+                matching=self.context.config.matching,
+                threshold=self.context.config.threshold,
             )
         else:
             result = merge_visual_units(
@@ -165,9 +200,29 @@ class Qwen35TomeBlock(nn.Module):
                 current_cu_seqlens,
                 r=self.context.config.r,
                 unit_size=self.context.config.unit_size,
+                matching=self.context.config.matching,
+                threshold=self.context.config.threshold,
             )
         merge_host_ms = (time.perf_counter() - merge_started) * 1000.0
+        merged_units = result.source_unit_indices.numel()
+        self.context.runtime = Qwen35TomeRuntime(
+            enabled=True,
+            layer=self.context.config.layer,
+            r=self.context.config.r,
+            input_tokens=hidden_states.shape[0],
+            compact_tokens=result.hidden_states.shape[0],
+            restored_tokens=hidden_states.shape[0],
+            merged_units=merged_units,
+            merge_host_ms=merge_host_ms,
+            proportional_attention=self.context.config.proportional_attention,
+            matching=self.context.config.matching,
+            threshold=self.context.config.threshold,
+        )
+        if merged_units == 0:
+            hidden_states = hidden_states + self.block.mlp(self.block.norm2(hidden_states))
+            return self._restore_output_length(hidden_states)
 
+        self.context.compression_applied = True
         self.context.token_sizes = result.token_sizes
         self.context.position_embeddings = tuple(
             position[result.retained_token_indices] for position in current_positions
@@ -191,23 +246,14 @@ class Qwen35TomeBlock(nn.Module):
         ).reshape(-1)
         restore_indices[source_tokens] = restore_indices[destination_tokens]
         self.context.restore_indices = restore_indices
-        self.context.runtime = Qwen35TomeRuntime(
-            enabled=True,
-            layer=self.context.config.layer,
-            r=self.context.config.r,
-            input_tokens=hidden_states.shape[0],
-            compact_tokens=result.hidden_states.shape[0],
-            restored_tokens=hidden_states.shape[0],
-            merged_units=result.source_unit_indices.numel(),
-            merge_host_ms=merge_host_ms,
-            proportional_attention=self.context.config.proportional_attention,
-        )
         hidden_states = result.hidden_states
         hidden_states = hidden_states + self.block.mlp(self.block.norm2(hidden_states))
         return self._restore_output_length(hidden_states)
 
     def _restore_output_length(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.is_last_layer:
+            return hidden_states
+        if not self.context.compression_applied:
             return hidden_states
         restore_indices = self.context.restore_indices
         if restore_indices is None:

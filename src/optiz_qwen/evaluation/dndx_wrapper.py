@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -138,9 +139,23 @@ class VLMModel:
         if enabled not in {"1", "true", "yes", "on"}:
             self._tome_config = None
             return
+        scalar_threshold = os.environ.get("OPTIZ_QWEN_TOME_THRESHOLD")
+        schedule_json = os.environ.get("OPTIZ_QWEN_TOME_THRESHOLD_SCHEDULE")
+        if scalar_threshold is not None and schedule_json is not None:
+            raise ValueError("Configure either a scalar DToMe threshold or a schedule, not both.")
+        threshold = (
+            tuple(
+                (int(source_limit), float(value))
+                for source_limit, value in json.loads(schedule_json)
+            )
+            if schedule_json is not None
+            else float(scalar_threshold) if scalar_threshold is not None else None
+        )
         config = Qwen35TomeConfig(
             layer=int(os.environ.get("OPTIZ_QWEN_TOME_LAYER", "12")),
             r=int(os.environ.get("OPTIZ_QWEN_TOME_R", "1")),
+            matching=os.environ.get("OPTIZ_QWEN_TOME_MATCHING", "tome"),
+            threshold=threshold,
             proportional_attention=os.environ.get(
                 "OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION",
                 "",

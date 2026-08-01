@@ -26,7 +26,12 @@ from optiz_qwen.compression.qwen35_tome import (
     install_qwen35_tome,
     set_qwen35_tome_enabled,
 )
-from optiz_qwen.compression.tome import TomeMergeResult, merge_single_visual_sample, merge_visual_units
+from optiz_qwen.compression.tome import (
+    TomeMergeResult,
+    merge_single_visual_sample,
+    merge_visual_units,
+    visual_unit_matching_scores,
+)
 from optiz_qwen.compression.qserve_kv_cache import (
     QServeAttentionLayer,
     QServeFusedAttentionLayer,
@@ -70,4 +75,5 @@ __all__ = [
     "load_upstream_quant_module",
     "merge_visual_units",
     "merge_single_visual_sample",
+    "visual_unit_matching_scores",
 ]
