@@ -134,14 +134,76 @@ GDN 对同一 `hidden_states` 连续执行 QKV、Z、B、A 四次无 bias 线性
 仅 decode 融合的中文 +3.01% 吞吐明显高于控制组波动；英文 +1.28% 也高于本轮控制组，
 但优势较小，需要更多重复实验才能给出更强的统计结论。
 
+### 6.3 零额外权重副本正式实现
+
+正式实现不再长期保留原四份权重和一份拼接副本。安装时先构造 packed 权重，再把原有
+QKV、Z、B、A 四个 `nn.Linear.weight` 重新绑定为该存储的切片视图，因此
+`state_dict` 的键名和张量形状保持不变，多 token prefill 仍执行原四投影路径。
+
+18 层共 72 个投影的原权重与 packed 权重均为 606,339,072 bytes（578.25 MiB）。PPU
+实测安装前后 `torch.cuda.memory_allocated` 均为 8,853,537,792 bytes，差值严格为 0。
+
+去除热路径中的重复形状检查和统计锁后，中英文各 150 题最终配对结果如下：
+
+| 数据集 | 指标 | Baseline | 零副本融合 | 变化 |
+|---|---|---:|---:|---:|
+| EN150 | Accuracy | 75.333% | 75.333% | 0 |
+| EN150 | TTFT | 150.413 ms | 148.833 ms | -1.05% |
+| EN150 | Throughput | 71.844 tok/s | 73.284 tok/s | +2.00% |
+| EN150 | Elapsed | 341.977 ms | 337.809 ms | -1.22% |
+| CN150 | Accuracy | 79.333% | 79.333% | 0 |
+| CN150 | TTFT | 119.539 ms | 119.379 ms | -0.13% |
+| CN150 | Throughput | 53.078 tok/s | 54.035 tok/s | +1.80% |
+| CN150 | Elapsed | 926.864 ms | 909.312 ms | -1.89% |
+
+300 题的选项均无分歧；解释文本仍有 EN 1 题、CN 10 题措辞不同，与临时原型一致。
+该结果证明零副本版本保留了约 2% 的 decode 收益，但也进一步确认投影融合不是 TTFT
+大幅优化的来源。
+
+### 6.4 PPU prefill Delta Rule 内核
+
+正式目标是优化 Transformers 调用的 chunk Delta Rule 路径。当前第一版设备实现并非论文式
+分块算法，而是针对 Qwen3.5-2B 固定 `H=16, K=128, V=128` 的直接递推核：每个 block
+负责一个 head/value 通道，128 个线程并行维护 key 维状态。该结构在 PPU 上已经显著快于
+当前 PyTorch chunk fallback，因此值得作为第一版后端保留。
+
+FP32 点积归约虽然达到 4.46--6.33 倍微基准加速，但输出误差约 0.0026--0.0039、状态误差
+约 0.0085--0.0180，并在 EN20 造成 1 题由对变错，因此拒绝。改为 FP64 点积归约、保持
+FP32 recurrent state 后：
+
+| 序列长度 | 官方 fallback | PPU kernel | 加速 | 输出最大误差 | 状态最大误差 |
+|---:|---:|---:|---:|---:|---:|
+| 337 | 3.819 ms | 1.448 ms | 2.64x | 0.000488 | 1.37e-6 |
+| 360 | 3.829 ms | 1.551 ms | 2.47x | 0.000488 | 1.37e-6 |
+| 512 | 4.132 ms | 2.192 ms | 1.88x | 0.000488 | 2.03e-6 |
+
+全 18 层替换仍会累积数值扰动：EN150 有 3 个选项分歧、准确率净增 1 题；CN150 有
+5 个选项分歧、准确率净减 1 题。采用与题目内容无关的“仅最后 9 个 GDN 层”策略后：
+
+| 数据集 | 指标 | Baseline | 后 9 层 PPU kernel | 变化 |
+|---|---|---:|---:|---:|
+| EN150 | Accuracy | 75.333% | 76.000% | +0.67 pp |
+| EN150 | TTFT | 153.320 ms | 123.985 ms | -19.13% |
+| EN150 | Throughput | 70.166 tok/s | 70.025 tok/s | -0.20% |
+| EN150 | Elapsed | 348.587 ms | 319.749 ms | -8.27% |
+| CN150 | Accuracy | 79.333% | 80.000% | +0.67 pp |
+| CN150 | TTFT | 122.286 ms | 93.442 ms | -23.59% |
+| CN150 | Throughput | 52.156 tok/s | 52.085 tok/s | -0.14% |
+| CN150 | Elapsed | 945.542 ms | 935.697 ms | -1.04% |
+
+两种语言各有 1 个选项分歧，均为 baseline 错误或无法解析、kernel 版本回答正确；本轮
+300 题未观察到准确率回归。不过 EN 有 2 个、CN 有 40 个解释文本分歧，因此该实现不能
+宣称逐位等价，必须保持默认关闭并通过显式开关启用。
+
 ## 8. 工程限制
 
-当前临时原型通过拼接 18 层权重构建融合矩阵，额外占用约 **578.25 MiB** BF16 显存。
-这适合验证，不适合最终提交。正式实现应采用以下之一：
+6.2 的临时原型通过拼接 18 层权重构建融合矩阵，曾额外占用约 **578.25 MiB** BF16
+显存。6.3 已采用“一份 packed 权重作为唯一存储、原投影使用切片视图”的方案消除该
+副本。正式实现还有两项约束：
 
-1. 用一份 packed 权重作为唯一存储，prefill 的四次投影使用其切片视图；
-2. 编写 PPU 融合 GEMV 内核，直接读取原四份权重并一次调度输出；
-3. 将投影融合纳入完整 decode CUDAGraph，比较融合在图捕获后的边际收益。
+1. 必须在模型到达最终 device 和 dtype 后安装；安装后再次迁移会立即报错；
+2. 当前收益来自一次大 `F.linear`，后续仍可比较 PPU 融合 GEMV 或完整 decode
+   CUDAGraph 的边际收益。
 
 此外，当前 wrapper 使用 Python streamer，TTFT 会包含线程与文本块输出行为。后续需要
 在模型 forward 边界增加设备事件计时，区分真实首 token 完成与 streamer 可见时间。
@@ -158,8 +220,11 @@ GDN 对同一 `hidden_states` 连续执行 QKV、Z、B、A 四次无 bias 线性
 ### 最高收益主线
 
 - **PPU chunk Delta Rule 内核**：占已拆出 GDN prefill 的约 88.3%，是唯一具有大幅降低
-  TTFT 潜力的目标。应参考 Gated DeltaNet、FLA 和 FlashQLA 的分块算法，但使用 PPU SDK
-  实现，不照搬 CUDA/Triton 代码。
+  TTFT 潜力的目标。首个 PPU 直接递推核已将后 9 层方案的 TTFT 降低 19%--24%，证明
+  路线有效；下一步应比较真正的 chunk/blocked PPU 算法能否在不扩大误差的前提下继续
+  提升长序列性能。
+- **已完成内核契约与正式后端**：仓库包含与 Transformers fallback 对齐的 FP32 状态
+  reference、误差比较器、HGGC/CUDA-compatible 设备源码、显式层选择和默认关闭开关。
 
 ### 拒绝
 
@@ -180,5 +245,21 @@ GDN 对同一 `hidden_states` 连续执行 QKV、Z、B、A 四次无 bias 线性
 - `decode_fused_projection_cn150.json`
 - `control_baseline_en50.json`
 - `control_baseline_cn50.json`
+
+零额外权重副本正式实现的最终证据位于
+`benchmarks/output/ppu_gdn_projection_fusion_20260801/`：
+
+- `en150.json`
+- `cn150.json`
+
+PPU Delta Rule 的微基准、全 18 层结果和后 9 层结果位于
+`benchmarks/output/ppu_chunk_delta_20260801/`，主要文件包括：
+
+- `microbenchmark_fp32_reduction.json`
+- `microbenchmark_fp64_reduction.json`
+- `en150_fp64_reduction.json`
+- `cn150_fp64_reduction.json`
+- `en150_last9.json`
+- `cn150_last9.json`
 
 该目录属于 benchmark 输出，不随 Git 跟踪；报告中的数值均来自上述实际运行结果。
