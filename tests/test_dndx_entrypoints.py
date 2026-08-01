@@ -13,10 +13,12 @@ from optiz_qwen.evaluation.dndx_public_benchmark import (
     compute_throughput,
     extract_answer,
     fixed_generation_config,
+    gdn_projection_cli_environment,
     kv_chain_cli_environment,
     Sample,
     select_samples,
     runner_cli_environment,
+    ppu_delta_cli_environment,
     tome_cli_environment,
     visual_cli_environment,
 )
@@ -154,6 +156,46 @@ def test_tome_cli_environment_is_explicit_and_scoped(monkeypatch) -> None:
         assert os.environ["OPTIZ_QWEN_TOME_LAYER"] == "8"
         assert os.environ["OPTIZ_QWEN_TOME_R"] == "2"
         assert os.environ["OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION"] == "1"
+
+
+def test_gdn_projection_cli_environment_is_explicit_and_scoped(monkeypatch) -> None:
+    import os
+
+    key = "OPTIZ_QWEN_GDN_DECODE_PROJECTION_FUSION"
+    monkeypatch.setenv(key, "1")
+    with gdn_projection_cli_environment(
+        Namespace(enable_gdn_decode_projection_fusion=False)
+    ):
+        assert key not in os.environ
+    assert os.environ[key] == "1"
+
+    monkeypatch.delenv(key)
+    with gdn_projection_cli_environment(
+        Namespace(enable_gdn_decode_projection_fusion=True)
+    ):
+        assert os.environ[key] == "1"
+
+
+def test_ppu_delta_cli_environment_is_explicit_and_scoped(monkeypatch) -> None:
+    import os
+
+    key = "OPTIZ_QWEN_PPU_DELTA_KERNEL"
+    monkeypatch.setenv(key, "1")
+    with ppu_delta_cli_environment(Namespace(enable_ppu_delta_kernel=False)):
+        assert key not in os.environ
+    assert os.environ[key] == "1"
+
+    monkeypatch.delenv(key)
+    args = Namespace(
+        enable_ppu_delta_kernel=True,
+        ppu_delta_kernel_layers=9,
+        ppu_delta_kernel_position="last",
+    )
+    with ppu_delta_cli_environment(args):
+        assert os.environ[key] == "1"
+        assert os.environ["OPTIZ_QWEN_PPU_DELTA_KERNEL_LAYERS"] == "9"
+        assert os.environ["OPTIZ_QWEN_PPU_DELTA_KERNEL_POSITION"] == "last"
+    assert key not in os.environ
 
 
 def test_stratified_sample_selection_is_balanced_and_reproducible() -> None:

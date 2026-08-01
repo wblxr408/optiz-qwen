@@ -41,6 +41,12 @@ TOME_ENV_KEYS = (
     "OPTIZ_QWEN_TOME_R",
     "OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION",
 )
+GDN_PROJECTION_ENV_KEYS = ("OPTIZ_QWEN_GDN_DECODE_PROJECTION_FUSION",)
+PPU_DELTA_ENV_KEYS = (
+    "OPTIZ_QWEN_PPU_DELTA_KERNEL",
+    "OPTIZ_QWEN_PPU_DELTA_KERNEL_LAYERS",
+    "OPTIZ_QWEN_PPU_DELTA_KERNEL_POSITION",
+)
 
 
 @dataclass
@@ -98,6 +104,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tome-layer", type=int, default=12)
     parser.add_argument("--tome-r", type=int, default=1)
     parser.add_argument("--tome-proportional-attention", action="store_true")
+    parser.add_argument("--enable-gdn-decode-projection-fusion", action="store_true")
+    parser.add_argument("--enable-ppu-delta-kernel", action="store_true")
+    parser.add_argument("--ppu-delta-kernel-layers", type=int, default=9)
+    parser.add_argument(
+        "--ppu-delta-kernel-position",
+        choices=["first", "last"],
+        default="last",
+    )
     parser.add_argument(
         "--enable-kv-chain",
         action="store_true",
@@ -343,6 +357,48 @@ def tome_cli_environment(args: argparse.Namespace):
                 os.environ[key] = value
 
 
+@contextmanager
+def gdn_projection_cli_environment(args: argparse.Namespace):
+    previous = {key: os.environ.get(key) for key in GDN_PROJECTION_ENV_KEYS}
+    if getattr(args, "enable_gdn_decode_projection_fusion", False):
+        os.environ["OPTIZ_QWEN_GDN_DECODE_PROJECTION_FUSION"] = "1"
+    else:
+        for key in GDN_PROJECTION_ENV_KEYS:
+            os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
+def ppu_delta_cli_environment(args: argparse.Namespace):
+    previous = {key: os.environ.get(key) for key in PPU_DELTA_ENV_KEYS}
+    if getattr(args, "enable_ppu_delta_kernel", False):
+        os.environ["OPTIZ_QWEN_PPU_DELTA_KERNEL"] = "1"
+        os.environ["OPTIZ_QWEN_PPU_DELTA_KERNEL_LAYERS"] = str(
+            getattr(args, "ppu_delta_kernel_layers", 9)
+        )
+        os.environ["OPTIZ_QWEN_PPU_DELTA_KERNEL_POSITION"] = str(
+            getattr(args, "ppu_delta_kernel_position", "last")
+        )
+    else:
+        for key in PPU_DELTA_ENV_KEYS:
+            os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def run_benchmark(args: argparse.Namespace) -> dict:
     benchmark_start = time.perf_counter()
     if getattr(args, "enable_kv_chain", False) and getattr(args, "generation_runner", "generate") != "greedy":
@@ -386,6 +442,8 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         runner_cli_environment(args),
         visual_cli_environment(args),
         tome_cli_environment(args),
+        gdn_projection_cli_environment(args),
+        ppu_delta_cli_environment(args),
     ):
         kv_chain_env_enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
         model = VLMModel(args.model_path, backend=args.backend, device=args.device)
@@ -484,6 +542,20 @@ def run_benchmark(args: argparse.Namespace) -> dict:
                 bool(getattr(args, "tome_proportional_attention", False))
                 if getattr(args, "enable_tome", False)
                 else False
+            ),
+            "gdn_decode_projection_fusion": bool(
+                getattr(args, "enable_gdn_decode_projection_fusion", False)
+            ),
+            "ppu_delta_kernel": bool(getattr(args, "enable_ppu_delta_kernel", False)),
+            "ppu_delta_kernel_layers": (
+                getattr(args, "ppu_delta_kernel_layers", None)
+                if getattr(args, "enable_ppu_delta_kernel", False)
+                else None
+            ),
+            "ppu_delta_kernel_position": (
+                getattr(args, "ppu_delta_kernel_position", None)
+                if getattr(args, "enable_ppu_delta_kernel", False)
+                else None
             ),
             "kv_chain_requested_by_cli": bool(getattr(args, "enable_kv_chain", False)),
             "kv_chain_enabled_by_env": kv_chain_env_enabled,

@@ -18,6 +18,13 @@ from optiz_qwen.compression import (
     install_qwen35_tome,
 )
 from optiz_qwen.scheduling import build_kv_chain, run_greedy_prefill_decode
+from optiz_qwen.ppu import (
+    Qwen35PpuDeltaConfig,
+    get_qwen35_gdn_decode_projection_runtime,
+    get_qwen35_ppu_delta_runtime,
+    install_qwen35_gdn_decode_projection_fusion,
+    install_qwen35_ppu_delta_kernel,
+)
 
 
 @dataclass
@@ -61,6 +68,8 @@ class VLMModel:
         self._tokenizer = None
         self._backend_name = "dummy"
         self._resolved_device = "cpu"
+        self._gdn_decode_projection_report = None
+        self._ppu_delta_report = None
 
         if backend in {"auto", "transformers"}:
             try:
@@ -130,6 +139,8 @@ class VLMModel:
             self._model = self._model.to(self._resolved_device)
         self._model = self._model.eval()
         self._configure_tome()
+        self._configure_ppu_delta_kernel()
+        self._configure_gdn_decode_projection_fusion()
         self._tokenizer = getattr(self._processor, "tokenizer", None)
 
     def _configure_tome(self) -> None:
@@ -161,6 +172,29 @@ class VLMModel:
             raise RuntimeError("processor does not expose an image_processor for visual budgeting.")
         image_processor.size = {"shortest_edge": pixel_budget, "longest_edge": pixel_budget}
         self._visual_pixel_budget = pixel_budget
+
+    def _configure_gdn_decode_projection_fusion(self) -> None:
+        enabled = os.environ.get(
+            "OPTIZ_QWEN_GDN_DECODE_PROJECTION_FUSION",
+            "",
+        ).strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            self._gdn_decode_projection_report = None
+            return
+        self._gdn_decode_projection_report = install_qwen35_gdn_decode_projection_fusion(
+            self._model
+        )
+
+    def _configure_ppu_delta_kernel(self) -> None:
+        enabled = os.environ.get("OPTIZ_QWEN_PPU_DELTA_KERNEL", "").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            self._ppu_delta_report = None
+            return
+        config = Qwen35PpuDeltaConfig(
+            kernel_layers=int(os.environ.get("OPTIZ_QWEN_PPU_DELTA_KERNEL_LAYERS", "9")),
+            position=os.environ.get("OPTIZ_QWEN_PPU_DELTA_KERNEL_POSITION", "last"),
+        )
+        self._ppu_delta_report = install_qwen35_ppu_delta_kernel(self._model, config)
 
     def _install_transformers_log_filters(self) -> None:
         class _MessageFilter(logging.Filter):
@@ -382,6 +416,16 @@ class VLMModel:
                 "tome": (
                     get_qwen35_tome_runtime(self._model)
                     if getattr(self, "_tome_config", None) is not None
+                    else None
+                ),
+                "gdn_decode_projection_fusion": (
+                    get_qwen35_gdn_decode_projection_runtime(self._model)
+                    if self._gdn_decode_projection_report is not None
+                    else None
+                ),
+                "ppu_delta_kernel": (
+                    get_qwen35_ppu_delta_runtime(self._model)
+                    if self._ppu_delta_report is not None
                     else None
                 ),
                 "kv_chain": kv_report.__dict__ if kv_report is not None else None,
