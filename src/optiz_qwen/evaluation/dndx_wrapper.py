@@ -52,15 +52,20 @@ class VLMModel:
         *,
         backend: str = "auto",
         device: str = "auto",
+        dtype: str | None = None,
     ) -> None:
+        if dtype not in {None, "bf16", "fp16"}:
+            raise ValueError("dtype must be None, bf16, or fp16")
         self.model_path = model_path
         self.device = device
+        self.dtype = dtype
         self.backend = backend
         self._model = None
         self._processor = None
         self._tokenizer = None
         self._backend_name = "dummy"
         self._resolved_device = "cpu"
+        self._resolved_dtype_name = "unloaded"
 
         if backend in {"auto", "transformers"}:
             try:
@@ -76,6 +81,15 @@ class VLMModel:
     @property
     def backend_name(self) -> str:
         return self._backend_name
+
+    @property
+    def dtype_name(self) -> str:
+        return self._resolved_dtype_name
+
+    @property
+    def quantization_config(self):
+        config = getattr(self._model, "config", None)
+        return getattr(config, "quantization_config", None)
 
     def generate_with_metrics(
         self,
@@ -120,11 +134,17 @@ class VLMModel:
             trust_remote_code=True,
         )
         self._configure_visual_token_budget()
+        torch_dtype = self._resolve_torch_dtype(torch)
+        self._resolved_dtype_name = {
+            torch.bfloat16: "bf16",
+            torch.float16: "fp16",
+            torch.float32: "fp32",
+        }.get(torch_dtype, str(torch_dtype).removeprefix("torch."))
         self._model = AutoModelForMultimodalLM.from_pretrained(
             self.model_path,
             local_files_only=True,
             trust_remote_code=True,
-            dtype=self._resolve_torch_dtype(torch),
+            dtype=torch_dtype,
         )
         if self._resolved_device != "cpu":
             self._model = self._model.to(self._resolved_device)
@@ -192,6 +212,10 @@ class VLMModel:
         return self.device
 
     def _resolve_torch_dtype(self, torch):
+        if self.dtype == "bf16":
+            return torch.bfloat16
+        if self.dtype == "fp16":
+            return torch.float16
         if str(self._resolved_device).startswith("cuda"):
             return torch.float16
         return torch.float32
