@@ -6,6 +6,7 @@ __pycache__/
 venv/
 env/
 *.pyc
+<<<<<<< HEAD
 *.pyo
 *.pyd
 .Python
@@ -38,6 +39,10 @@ $RECYCLE.BIN/
 .settings/
 .fleet/
 .zed/
+=======
+.venv-*/
+*.egg-info/
+>>>>>>> 85c6a87 (Add GPTQ W4A16 llmcompressor quantization pipeline)
 
 # Local data and model artifacts
 resources/eval_dataset/raw/*
