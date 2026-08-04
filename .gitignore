@@ -38,6 +38,8 @@ $RECYCLE.BIN/
 .settings/
 .fleet/
 .zed/
+.venv-*/
+*.egg-info/
 
 # Local data and model artifacts
 resources/eval_dataset/raw/*

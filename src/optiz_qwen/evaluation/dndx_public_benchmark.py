@@ -85,6 +85,12 @@ def parse_args() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--dtype",
+        choices=["bf16", "fp16"],
+        default=None,
+        help="Override model floating-point dtype; omitted preserves legacy behavior.",
+    )
     parser.add_argument("--warmup-samples", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=OFFICIAL_MAX_NEW_TOKENS)
     parser.add_argument(
@@ -211,6 +217,43 @@ def fixed_generation_config(
     max_new_tokens: int = OFFICIAL_MAX_NEW_TOKENS,
 ) -> GenerationConfig:
     return GenerationConfig(max_new_tokens=max_new_tokens, temperature=0.0, top_p=1.0)
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "to_dict"):
+        return _json_safe(value.to_dict())
+    return str(value)
+
+
+def quantization_metadata(quantization_config) -> dict:
+    config = _json_safe(quantization_config)
+    if not isinstance(config, dict):
+        return {
+            "enabled": False,
+            "quant_method": None,
+            "format": None,
+            "status": None,
+            "weights": None,
+            "config": config,
+        }
+
+    config_groups = config.get("config_groups") or {}
+    first_group = next(iter(config_groups.values()), {})
+    weights = first_group.get("weights") if isinstance(first_group, dict) else None
+    return {
+        "enabled": True,
+        "quant_method": config.get("quant_method"),
+        "format": config.get("format"),
+        "status": config.get("quantization_status"),
+        "weights": weights,
+        "config": config,
+    }
 
 
 def compute_throughput(
@@ -388,7 +431,12 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         tome_cli_environment(args),
     ):
         kv_chain_env_enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
-        model = VLMModel(args.model_path, backend=args.backend, device=args.device)
+        model = VLMModel(
+            args.model_path,
+            backend=args.backend,
+            device=args.device,
+            dtype=getattr(args, "dtype", None),
+        )
 
         for sample in samples[: min(args.warmup_samples, len(samples))]:
             settle_runtime(model)
@@ -460,6 +508,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         "benchmark_version": "dndx_public_self_test_v1.1",
         "timestamp": datetime.now().isoformat(),
         "dataset_path": str(dataset_path),
+        "model_path": str(Path(args.model_path).resolve()),
         "sample_count": len(samples),
         "seed": args.seed,
         "sample_selection": {
@@ -468,7 +517,15 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "source_sample_count": len(all_samples),
         },
         "backend": model.backend_name,
-        "generation": {"max_new_tokens": args.max_new_tokens},
+        "dtype": model.dtype_name,
+        "quantization": quantization_metadata(model.quantization_config),
+        "generation": {
+            "max_new_tokens": args.max_new_tokens,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "do_sample": False,
+            "runner": getattr(args, "generation_runner", "generate"),
+        },
         "optimization": {
             "generation_runner": getattr(args, "generation_runner", "generate"),
             "visual_pixel_budget": getattr(args, "visual_pixel_budget", None),
@@ -524,6 +581,8 @@ def main() -> None:
         json.dumps(
             {
                 "backend": payload["backend"],
+                "dtype": payload["dtype"],
+                "quantization": payload["quantization"]["quant_method"],
                 "sample_count": payload["sample_count"],
                 "avg_ttft_ms": payload["performance"]["avg_ttft_ms"],
                 "avg_throughput_tokens_per_sec": payload["performance"][
