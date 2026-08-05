@@ -32,6 +32,9 @@ KV_CHAIN_ENV_KEYS = (
     "OPTIZ_QWEN_KV_CHAIN_V_BITS",
     "OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE",
     "OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH",
+    "OPTIZ_QWEN_KV_CHAIN_ACTIVATION_THRESHOLD",
+    "OPTIZ_QWEN_KV_CHAIN_DECODE_WARMUP_TOKENS",
+    "OPTIZ_QWEN_KV_CHAIN_ATTENTION_BACKEND",
 )
 RUNNER_ENV_KEYS = ("OPTIZ_QWEN_GENERATION_RUNNER",)
 VISUAL_ENV_KEYS = ("OPTIZ_QWEN_VISUAL_PIXEL_BUDGET",)
@@ -118,6 +121,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-chain-v-bits", type=int, default=4)
     parser.add_argument("--kv-chain-group-size", type=int, default=32)
     parser.add_argument("--kv-chain-residual-length", type=int, default=32)
+    parser.add_argument(
+        "--kv-chain-activation-threshold",
+        type=int,
+        default=1024,
+        help="Keep native dense decode below this real KV-token threshold.",
+    )
+    parser.add_argument(
+        "--kv-chain-decode-warmup-tokens",
+        type=int,
+        default=4,
+        help="Keep initial answer-forming decode tokens on the native cache.",
+    )
+    parser.add_argument(
+        "--kv-chain-attention-backend",
+        choices=["triton_int4_split_decode", "triton_int4_decode", "triton_int8_decode"],
+        default="triton_int4_split_decode",
+    )
     return parser.parse_args()
 
 
@@ -320,6 +340,15 @@ def kv_chain_cli_environment(args: argparse.Namespace):
         os.environ["OPTIZ_QWEN_KV_CHAIN_V_BITS"] = str(getattr(args, "kv_chain_v_bits", 4))
         os.environ["OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE"] = str(getattr(args, "kv_chain_group_size", 32))
         os.environ["OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH"] = str(getattr(args, "kv_chain_residual_length", 32))
+        os.environ["OPTIZ_QWEN_KV_CHAIN_ACTIVATION_THRESHOLD"] = str(
+            getattr(args, "kv_chain_activation_threshold", 1024)
+        )
+        os.environ["OPTIZ_QWEN_KV_CHAIN_DECODE_WARMUP_TOKENS"] = str(
+            getattr(args, "kv_chain_decode_warmup_tokens", 4)
+        )
+        os.environ["OPTIZ_QWEN_KV_CHAIN_ATTENTION_BACKEND"] = str(
+            getattr(args, "kv_chain_attention_backend", "triton_int4_split_decode")
+        )
     else:
         for key in KV_CHAIN_ENV_KEYS:
             os.environ.pop(key, None)

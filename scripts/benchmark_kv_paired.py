@@ -28,6 +28,9 @@ KV_ENV_KEYS = (
     "OPTIZ_QWEN_KV_CHAIN_V_BITS",
     "OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE",
     "OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH",
+    "OPTIZ_QWEN_KV_CHAIN_ACTIVATION_THRESHOLD",
+    "OPTIZ_QWEN_KV_CHAIN_DECODE_WARMUP_TOKENS",
+    "OPTIZ_QWEN_KV_CHAIN_ATTENTION_BACKEND",
 )
 
 
@@ -42,12 +45,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--kv-chain", default="qserve_deferred_split_fused_kv")
+    parser.add_argument("--kv-chain-activation-threshold", type=int, default=1024)
+    parser.add_argument("--kv-chain-decode-warmup-tokens", type=int, default=4)
+    parser.add_argument("--kv-chain-k-bits", type=int, choices=[4, 8], default=4)
+    parser.add_argument("--kv-chain-v-bits", type=int, choices=[4, 8], default=4)
+    parser.add_argument(
+        "--kv-chain-attention-backend",
+        choices=["triton_int4_split_decode", "triton_int4_decode", "triton_int8_decode"],
+        default="triton_int4_split_decode",
+    )
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 
 
 @contextmanager
-def kv_mode(chain_name: str | None) -> Iterator[None]:
+def kv_mode(
+    chain_name: str | None,
+    activation_threshold: int = 1024,
+    decode_warmup_tokens: int = 4,
+    k_bits: int = 4,
+    v_bits: int = 4,
+    attention_backend: str = "triton_int4_split_decode",
+) -> Iterator[None]:
     all_keys = (*KV_ENV_KEYS, "OPTIZ_QWEN_GENERATION_RUNNER")
     previous = {key: os.environ.get(key) for key in all_keys}
     try:
@@ -58,10 +77,13 @@ def kv_mode(chain_name: str | None) -> Iterator[None]:
         else:
             os.environ["OPTIZ_QWEN_KV_CHAIN_ENABLED"] = "1"
             os.environ["OPTIZ_QWEN_KV_CHAIN"] = chain_name
-            os.environ["OPTIZ_QWEN_KV_CHAIN_K_BITS"] = "4"
-            os.environ["OPTIZ_QWEN_KV_CHAIN_V_BITS"] = "4"
+            os.environ["OPTIZ_QWEN_KV_CHAIN_K_BITS"] = str(k_bits)
+            os.environ["OPTIZ_QWEN_KV_CHAIN_V_BITS"] = str(v_bits)
             os.environ["OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE"] = "32"
             os.environ["OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH"] = "32"
+            os.environ["OPTIZ_QWEN_KV_CHAIN_ACTIVATION_THRESHOLD"] = str(activation_threshold)
+            os.environ["OPTIZ_QWEN_KV_CHAIN_DECODE_WARMUP_TOKENS"] = str(decode_warmup_tokens)
+            os.environ["OPTIZ_QWEN_KV_CHAIN_ATTENTION_BACKEND"] = attention_backend
         yield
     finally:
         for key, value in previous.items():
@@ -85,10 +107,27 @@ def restore_native_full_attention(model: VLMModel) -> None:
             delattr(attention, "_optiz_original_forward")
 
 
-def run_once(model: VLMModel, sample, chain_name: str | None, max_new_tokens: int) -> dict:
+def run_once(
+    model: VLMModel,
+    sample,
+    chain_name: str | None,
+    max_new_tokens: int,
+    activation_threshold: int,
+    decode_warmup_tokens: int,
+    k_bits: int,
+    v_bits: int,
+    attention_backend: str,
+) -> dict:
     restore_native_full_attention(model)
     settle_runtime(model)
-    with kv_mode(chain_name):
+    with kv_mode(
+        chain_name,
+        activation_threshold,
+        decode_warmup_tokens,
+        k_bits,
+        v_bits,
+        attention_backend,
+    ):
         result = model.generate_with_metrics(
             image=decode_image(sample.image_b64),
             prompt=build_prompt(sample),
@@ -112,6 +151,9 @@ def run_once(model: VLMModel, sample, chain_name: str | None, max_new_tokens: in
         "kernel_calls": int(runtime.get("kernel_calls", 0)),
         "fallback_calls": int(runtime.get("fallback_calls", 0)),
         "active_backend": runtime.get("active_backend"),
+        "activation_threshold": (
+            result.meta.get("kv_chain") or {}
+        ).get("activation_threshold"),
     }
 
 
@@ -153,14 +195,34 @@ def main() -> None:
     for chain_name in (None, args.kv_chain):
         for sample in samples:
             for _ in range(args.warmups):
-                run_once(model, sample, chain_name, args.max_new_tokens)
+                run_once(
+                    model,
+                    sample,
+                    chain_name,
+                    args.max_new_tokens,
+                    args.kv_chain_activation_threshold,
+                    args.kv_chain_decode_warmup_tokens,
+                    args.kv_chain_k_bits,
+                    args.kv_chain_v_bits,
+                    args.kv_chain_attention_backend,
+                )
 
     raw_records: list[dict] = []
     for repeat in range(args.repeats):
         order = (args.kv_chain, None) if repeat % 2 else (None, args.kv_chain)
         for sample in samples:
             for chain_name in order:
-                record = run_once(model, sample, chain_name, args.max_new_tokens)
+                record = run_once(
+                    model,
+                    sample,
+                    chain_name,
+                    args.max_new_tokens,
+                    args.kv_chain_activation_threshold,
+                    args.kv_chain_decode_warmup_tokens,
+                    args.kv_chain_k_bits,
+                    args.kv_chain_v_bits,
+                    args.kv_chain_attention_backend,
+                )
                 record["repeat"] = repeat + 1
                 record["sample_id"] = sample.sample_id
                 raw_records.append(record)
@@ -177,6 +239,11 @@ def main() -> None:
             "max_new_tokens": args.max_new_tokens,
             "warmups_per_sample_per_mode": args.warmups,
             "alternating_order": True,
+            "kv_chain_activation_threshold": args.kv_chain_activation_threshold,
+            "kv_chain_decode_warmup_tokens": args.kv_chain_decode_warmup_tokens,
+            "kv_chain_k_bits": args.kv_chain_k_bits,
+            "kv_chain_v_bits": args.kv_chain_v_bits,
+            "kv_chain_attention_backend": args.kv_chain_attention_backend,
         },
         "baseline": baseline_summary,
         "candidate": candidate_summary,

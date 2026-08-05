@@ -15,7 +15,10 @@ from optiz_qwen.compression.qserve_kv_cache import (
 )
 from optiz_qwen.scheduling import build_kv_chain
 from optiz_qwen.kernels.qwen35_fused_attention import _qserve_fused_forward
-from optiz_qwen.kernels.qserve_int4_attention import qserve_int4_split_decode_attention
+from optiz_qwen.kernels.qserve_int4_attention import (
+    qserve_int4_split_decode_attention,
+    qserve_int8_decode_attention,
+)
 
 
 class MinimalQwenConfig:
@@ -57,7 +60,13 @@ def test_qserve_attention_layer_streams_decode_and_preserves_dtype() -> None:
 
 def test_deferred_split_cache_preserves_prefill_dense_until_decode() -> None:
     layer = QServeDeferredSplitFusedAttentionLayer(
-        QServeKvConfig(k_bits=4, v_bits=4, group_size=16, residual_length=16)
+        QServeKvConfig(
+            k_bits=4,
+            v_bits=4,
+            group_size=16,
+            residual_length=16,
+            activation_threshold=32,
+        )
     )
     prefill_keys = torch.randn(1, 2, 16, 16)
     prefill_values = torch.randn_like(prefill_keys)
@@ -71,9 +80,29 @@ def test_deferred_split_cache_preserves_prefill_dense_until_decode() -> None:
     decode_value = torch.randn_like(decode_key)
     layer.update(decode_key, decode_value)
 
-    assert layer._deferred_prefill is False
-    assert layer._key_code is not None
+    assert layer._deferred_prefill is True
+    assert layer._key_code is None
+    assert torch.equal(layer.materialize()[0], torch.cat([prefill_keys, decode_key], dim=-2))
     assert layer.get_seq_length() == 17
+
+
+def test_deferred_split_layer_packs_only_after_activation_threshold() -> None:
+    layer = QServeDeferredSplitFusedAttentionLayer(
+        QServeKvConfig(
+            k_bits=4,
+            v_bits=4,
+            group_size=16,
+            residual_length=16,
+            activation_threshold=32,
+        )
+    )
+    prefill_keys = torch.randn(1, 2, 31, 16)
+    prefill_values = torch.randn_like(prefill_keys)
+    layer.update(prefill_keys, prefill_values)
+    layer.update(torch.randn(1, 2, 1, 16), torch.randn(1, 2, 1, 16))
+
+    assert layer._key_code is not None
+    assert layer._deferred_prefill is False
 
 
 def test_deferred_split_layer_can_adopt_native_prefill_tensors() -> None:
@@ -99,6 +128,16 @@ def test_deferred_split_chain_reports_its_runtime_implementation() -> None:
 
     assert isinstance(cache, QServeDeferredSplitFusedKvCache)
     assert report.implementation == "qserve_triton_int4_deferred_split_decode"
+
+
+def test_qserve_config_rejects_unknown_attention_backend() -> None:
+    with pytest.raises(ValueError, match="attention_backend"):
+        QServeKvConfig(attention_backend="unknown").validate()
+
+
+def test_qserve_config_requires_int8_backend_for_8bit_kv() -> None:
+    with pytest.raises(ValueError, match="requires triton_int8_decode"):
+        QServeKvConfig(k_bits=8, v_bits=8).validate()
 
 
 def test_removed_kv_chain_names_are_rejected() -> None:
@@ -145,6 +184,35 @@ def test_split_kernel_matches_eager_attention_for_the_same_quantized_kv() -> Non
     layer.update(keys, values)
 
     actual = qserve_int4_split_decode_attention(query, layer, scaling=1 / (32**0.5))
+    dense_keys, dense_values = layer.materialize()
+    expected = F.scaled_dot_product_attention(
+        query,
+        dense_keys.repeat_interleave(4, dim=1),
+        dense_values.repeat_interleave(4, dim=1),
+        is_causal=False,
+    ).transpose(1, 2)
+
+    torch.testing.assert_close(actual, expected, rtol=3e-3, atol=5e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA Triton runtime")
+def test_int8_kernel_matches_eager_attention_for_the_same_quantized_kv() -> None:
+    torch.manual_seed(37)
+    layer = QServeAttentionLayer(
+        QServeKvConfig(
+            k_bits=8,
+            v_bits=8,
+            group_size=32,
+            residual_length=32,
+            attention_backend="triton_int8_decode",
+        )
+    )
+    keys = torch.randn(1, 2, 32, 32, device="cuda", dtype=torch.float16)
+    values = torch.randn_like(keys)
+    query = torch.randn(1, 8, 1, 32, device="cuda", dtype=torch.float16)
+    layer.update(keys, values)
+
+    actual = qserve_int8_decode_attention(query, layer, scaling=1 / (32**0.5))
     dense_keys, dense_values = layer.materialize()
     expected = F.scaled_dot_product_attention(
         query,

@@ -22,6 +22,9 @@ class KVChainReport:
     v_bits: int | None = None
     group_size: int | None = None
     residual_length: int | None = None
+    activation_threshold: int | None = None
+    decode_warmup_tokens: int | None = None
+    attention_backend: str | None = None
     implementation: str | None = None
 
 
@@ -48,6 +51,9 @@ def build_kv_chain(
             v_bits=cfg.v_bits,
             group_size=cfg.group_size,
             residual_length=cfg.residual_length,
+            activation_threshold=cfg.activation_threshold,
+            decode_warmup_tokens=cfg.decode_warmup_tokens,
+            attention_backend=cfg.attention_backend,
             implementation="qserve_triton_int4_deferred_split_decode",
         )
 

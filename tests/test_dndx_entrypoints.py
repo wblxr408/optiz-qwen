@@ -82,6 +82,9 @@ def test_kv_chain_cli_environment_sets_and_restores_env(monkeypatch) -> None:
         kv_chain_v_bits=4,
         kv_chain_group_size=32,
         kv_chain_residual_length=32,
+        kv_chain_activation_threshold=1024,
+        kv_chain_decode_warmup_tokens=4,
+        kv_chain_attention_backend="triton_int4_split_decode",
     )
 
     with kv_chain_cli_environment(args):
@@ -89,6 +92,9 @@ def test_kv_chain_cli_environment_sets_and_restores_env(monkeypatch) -> None:
 
         assert os.environ["OPTIZ_QWEN_KV_CHAIN_ENABLED"] == "1"
         assert os.environ["OPTIZ_QWEN_KV_CHAIN"] == "qserve_deferred_split_fused_kv"
+        assert os.environ["OPTIZ_QWEN_KV_CHAIN_ACTIVATION_THRESHOLD"] == "1024"
+        assert os.environ["OPTIZ_QWEN_KV_CHAIN_DECODE_WARMUP_TOKENS"] == "4"
+        assert os.environ["OPTIZ_QWEN_KV_CHAIN_ATTENTION_BACKEND"] == "triton_int4_split_decode"
 
     import os
 

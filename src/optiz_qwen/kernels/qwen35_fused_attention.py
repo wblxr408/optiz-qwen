@@ -9,6 +9,7 @@ import torch
 
 from optiz_qwen.kernels.qserve_int4_attention import (
     qserve_int4_decode_attention,
+    qserve_int8_decode_attention,
     qserve_int4_split_decode_attention,
     triton_int4_decode_available,
 )
@@ -65,8 +66,11 @@ def _qserve_fused_forward(
         )
 
     if fused_decode:
-        if getattr(past_key_values, "attention_backend", "triton_int4_decode") == "triton_int4_split_decode":
+        backend = getattr(past_key_values, "attention_backend", "triton_int4_decode")
+        if backend == "triton_int4_split_decode":
             attn_output = qserve_int4_split_decode_attention(query_states, cache_layer, scaling=self.scaling)
+        elif backend == "triton_int8_decode":
+            attn_output = qserve_int8_decode_attention(query_states, cache_layer, scaling=self.scaling)
         else:
             attn_output = qserve_int4_decode_attention(query_states, cache_layer, scaling=self.scaling)
         attn_weights = None

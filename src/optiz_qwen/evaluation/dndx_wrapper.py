@@ -292,10 +292,15 @@ class VLMModel:
 
                 kv_chain = DynamicCache(config=self._model.config)
             post_prefill_callback = None
+            post_decode_callback = None
             if deferred_fused_chain:
                 from optiz_qwen.kernels import install_qwen35_fused_attention
 
-                post_prefill_callback = lambda: install_qwen35_fused_attention(self._model)
+                def _install_after_threshold() -> None:
+                    if getattr(kv_chain, "packed_decode_active", lambda: False)():
+                        install_qwen35_fused_attention(self._model)
+
+                post_decode_callback = _install_after_threshold
             start = time.perf_counter()
             generated_ids, runtime_stats = run_greedy_prefill_decode(
                 self._model,
@@ -305,6 +310,7 @@ class VLMModel:
                 eos_token_id=getattr(self._tokenizer, "eos_token_id", None),
                 kv_cache=kv_chain,
                 post_prefill_callback=post_prefill_callback,
+                post_decode_callback=post_decode_callback,
             )
             first_chunk_at = start + runtime_stats.ttft_seconds
             chunks = []
@@ -354,6 +360,11 @@ class VLMModel:
             end = time.perf_counter()
             output_ids = output_holder["output_ids"]
             runtime_stats = None
+        # Performance metrics cover model generation only.  The optional
+        # logits-based answer recovery below is an evaluation-side accuracy
+        # fallback, so including it would make two equal generation paths look
+        # different merely because one emitted a more parseable string.
+        generation_end = end
         generated_ids = output_ids[0][input_len:]
         text = "".join(chunks).strip()
         if not text:
@@ -391,14 +402,18 @@ class VLMModel:
                 "active_backend": (
                     getattr(kv_chain, "attention_backend", "triton_int4_decode")
                     if getattr(kv_chain, "kernel_calls", 0) > 0
-                    else "torch_materialize_fallback"
+                    else (
+                        "native_dense_below_threshold"
+                        if not getattr(kv_chain, "packed_decode_active", lambda: False)()
+                        else "packed_kv_not_amortized"
+                    )
                 ),
             }
         return GenerationResult(
             text=text,
             token_count=int(generated_ids.shape[0]),
             ttft_seconds=ttft,
-            elapsed_seconds=end - start,
+            elapsed_seconds=generation_end - start,
             meta={
                 "backend": "transformers",
                 "generation_runner": "greedy" if use_prefill_decode else "generate",
@@ -429,6 +444,11 @@ class VLMModel:
             v_bits=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_V_BITS", "4")),
             group_size=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE", "32")),
             residual_length=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH", "32")),
+            activation_threshold=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_ACTIVATION_THRESHOLD", "1024")),
+            decode_warmup_tokens=int(os.environ.get("OPTIZ_QWEN_KV_CHAIN_DECODE_WARMUP_TOKENS", "4")),
+            attention_backend=os.environ.get(
+                "OPTIZ_QWEN_KV_CHAIN_ATTENTION_BACKEND", "triton_int4_split_decode"
+            ).strip(),
         )
         kv_chain, kv_report = build_kv_chain(
             chain_name=chain_name,

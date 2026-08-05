@@ -28,16 +28,30 @@ class QServeKvConfig:
     v_bits: int = 4
     group_size: int = 32
     residual_length: int = 32
+    activation_threshold: int = 1024
+    decode_warmup_tokens: int = 4
+    attention_backend: str = "triton_int4_split_decode"
 
     def validate(self) -> None:
-        if self.k_bits != 4 or self.v_bits != 4:
-            raise ValueError("qserve_kv currently supports 4-bit K/V only.")
+        if self.k_bits not in {4, 8} or self.v_bits != self.k_bits:
+            raise ValueError("qserve_kv supports matched 4-bit or 8-bit K/V only.")
         if self.group_size <= 0:
             raise ValueError("qserve_kv group_size must be positive.")
         if self.residual_length <= 0:
             raise ValueError("qserve_kv residual_length must be positive.")
         if self.residual_length % self.group_size != 0:
             raise ValueError("qserve_kv residual_length must be divisible by group_size.")
+        if self.activation_threshold < self.residual_length:
+            raise ValueError("qserve_kv activation_threshold must be at least residual_length.")
+        if self.decode_warmup_tokens < 0:
+            raise ValueError("qserve_kv decode_warmup_tokens must be non-negative.")
+        valid_backends = {"triton_int4_decode", "triton_int4_split_decode", "triton_int8_decode"}
+        if self.attention_backend not in valid_backends:
+            raise ValueError("qserve_kv attention_backend must be a retained Triton decode backend.")
+        if self.k_bits == 8 and self.attention_backend != "triton_int8_decode":
+            raise ValueError("8-bit QServe KV requires triton_int8_decode.")
+        if self.k_bits == 4 and self.attention_backend == "triton_int8_decode":
+            raise ValueError("triton_int8_decode requires 8-bit QServe KV.")
 
 
 @dataclass(frozen=True)
@@ -48,6 +62,9 @@ class QServeKvCacheReport:
     v_bits: int
     group_size: int
     residual_length: int
+    activation_threshold: int
+    decode_warmup_tokens: int
+    attention_backend: str
     implementation: str = "qserve_deferred_split_packed_kv"
 
 
@@ -237,13 +254,17 @@ class QServeAttentionLayer(CacheLayerMixin):
         self._value_residual = values[..., quant_len:, :].contiguous()
 
     def _quantize_and_append_keys(self, key_states: torch.Tensor) -> None:
-        packed, scale, mn = self._quantize_4bit_groupwise(key_states, self.config.group_size)
+        packed, scale, mn = self._quantize_groupwise(
+            key_states, self.config.group_size, self.config.k_bits
+        )
         self._key_code = self._concat_or_init(self._key_code, packed, dim=-2)
         self._key_scale = self._concat_or_init(self._key_scale, scale, dim=-2)
         self._key_min = self._concat_or_init(self._key_min, mn, dim=-2)
 
     def _quantize_and_append_values(self, value_states: torch.Tensor) -> None:
-        packed, scale, mn = self._quantize_4bit_groupwise(value_states, self.config.group_size)
+        packed, scale, mn = self._quantize_groupwise(
+            value_states, self.config.group_size, self.config.v_bits
+        )
         self._value_code = self._concat_or_init(self._value_code, packed, dim=-2)
         self._value_scale = self._concat_or_init(self._value_scale, scale, dim=-2)
         self._value_min = self._concat_or_init(self._value_min, mn, dim=-2)
@@ -252,13 +273,14 @@ class QServeAttentionLayer(CacheLayerMixin):
         parts = []
         if self._key_code is not None:
             parts.append(
-                self._dequantize_4bit_groupwise(
+                self._dequantize_groupwise(
                     self._key_code,
                     self._key_scale,
                     self._key_min,
                     self.config.group_size,
                     self._key_last_dim,
                     self.dtype,
+                    self.config.k_bits,
                 )
             )
         if self._key_residual is not None and self._key_residual.shape[-2] > 0:
@@ -271,13 +293,14 @@ class QServeAttentionLayer(CacheLayerMixin):
         parts = []
         if self._value_code is not None:
             parts.append(
-                self._dequantize_4bit_groupwise(
+                self._dequantize_groupwise(
                     self._value_code,
                     self._value_scale,
                     self._value_min,
                     self.config.group_size,
                     self._value_last_dim,
                     self.dtype,
+                    self.config.v_bits,
                 )
             )
         if self._value_residual is not None and self._value_residual.shape[-2] > 0:
@@ -287,9 +310,10 @@ class QServeAttentionLayer(CacheLayerMixin):
         return torch.cat(parts, dim=-2) if len(parts) > 1 else parts[0]
 
     @staticmethod
-    def _quantize_4bit_groupwise(
+    def _quantize_groupwise(
         tensor: torch.Tensor,
         group_size: int,
+        bits: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if tensor.shape[-1] % group_size != 0:
             raise ValueError(
@@ -302,22 +326,25 @@ class QServeAttentionLayer(CacheLayerMixin):
         grouped = tensor_f32.reshape(*original_shape[:-1], groups, group_size)
         group_min = grouped.amin(dim=-1, keepdim=True)
         group_max = grouped.amax(dim=-1, keepdim=True)
-        scale = (group_max - group_min) / 15.0
+        levels = (1 << bits) - 1
+        scale = (group_max - group_min) / float(levels)
         scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-        codes = torch.round((grouped - group_min) / scale).clamp(0, 15).to(torch.uint8)
-        packed = QServeAttentionLayer._pack_uint4(codes.reshape(*original_shape[:-1], last_dim))
+        codes = torch.round((grouped - group_min) / scale).clamp(0, levels).to(torch.uint8)
+        flattened = codes.reshape(*original_shape[:-1], last_dim)
+        packed = QServeAttentionLayer._pack_uint4(flattened) if bits == 4 else flattened.contiguous()
         return packed, scale.squeeze(-1), group_min.squeeze(-1)
 
     @staticmethod
-    def _dequantize_4bit_groupwise(
+    def _dequantize_groupwise(
         packed: torch.Tensor,
         scale: torch.Tensor,
         group_min: torch.Tensor,
         group_size: int,
         last_dim: int,
         dtype: torch.dtype,
+        bits: int,
     ) -> torch.Tensor:
-        codes = QServeAttentionLayer._unpack_uint4(packed, last_dim)
+        codes = QServeAttentionLayer._unpack_uint4(packed, last_dim) if bits == 4 else packed
         groups = last_dim // group_size
         codes = codes.reshape(*packed.shape[:-1], groups, group_size).to(torch.float32)
         scale = scale.unsqueeze(-1)
@@ -373,6 +400,9 @@ class QServeKvCache(DynamicCache):
             v_bits=self.qserve_config.v_bits,
             group_size=self.qserve_config.group_size,
             residual_length=self.qserve_config.residual_length,
+            activation_threshold=self.qserve_config.activation_threshold,
+            decode_warmup_tokens=self.qserve_config.decode_warmup_tokens,
+            attention_backend=self.qserve_config.attention_backend,
         )
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
@@ -421,6 +451,7 @@ class QServeFusedKvCache(QServeKvCache):
 
     def __init__(self, model_config: Any, qserve_config: QServeKvConfig | None = None) -> None:
         super().__init__(model_config=model_config, qserve_config=qserve_config)
+        self.attention_backend = self.qserve_config.attention_backend
         for layer_idx in self.full_attention_layers:
             self.layers[layer_idx] = QServeFusedAttentionLayer(self.qserve_config)
         self.kernel_calls = 0
@@ -440,7 +471,14 @@ class QServeSplitFusedKvCache(QServeFusedKvCache):
 
 
 class QServeDeferredSplitFusedAttentionLayer(QServeFusedAttentionLayer):
-    """Keeps prefill KV dense, then packs it just before the first decode step."""
+    """Keeps short-context KV dense and packs only after the measured threshold.
+
+    The public VLM evaluation has short image-text prompts.  Packing them on
+    the first decode both adds conversion cost and routes attention through a
+    kernel whose launch overhead is not amortized.  This layer therefore uses
+    the native dense cache until the real cache length reaches the configured
+    crossover, then switches once to packed KV for following decode steps.
+    """
 
     def __init__(self, config: QServeKvConfig) -> None:
         super().__init__(config)
@@ -475,11 +513,15 @@ class QServeDeferredSplitFusedAttentionLayer(QServeFusedAttentionLayer):
             prefill_values = self.values
             if prefill_keys is None or prefill_values is None:
                 raise RuntimeError("deferred qserve prefill cache is missing dense KV tensors.")
+            dense_keys = torch.cat([prefill_keys, key_states], dim=-2).contiguous()
+            dense_values = torch.cat([prefill_values, value_states], dim=-2).contiguous()
+            self._seq_length = int(dense_keys.shape[-2])
+            if self._seq_length < self.config.activation_threshold:
+                self.keys = dense_keys
+                self.values = dense_values
+                return dense_keys, dense_values
             self._deferred_prefill = False
-            self._rebuild_from_full(
-                torch.cat([prefill_keys, key_states], dim=-2).contiguous(),
-                torch.cat([prefill_values, value_states], dim=-2).contiguous(),
-            )
+            self._rebuild_from_full(dense_keys, dense_values)
             return key_states, value_states
 
         return super().update(key_states, value_states, *args, **kwargs)
@@ -539,6 +581,14 @@ class QServeDeferredSplitFusedKvCache(QServeSplitFusedKvCache):
         for attribute in ("_seen_tokens", "_max_batch_size", "_max_cache_len"):
             if hasattr(native_cache, attribute):
                 setattr(self, attribute, getattr(native_cache, attribute))
+
+    def packed_decode_active(self) -> bool:
+        """Whether every adapted full-attention layer has crossed the threshold."""
+
+        return bool(self.full_attention_layers) and all(
+            getattr(self.layers[layer_idx], "_key_code", None) is not None
+            for layer_idx in self.full_attention_layers
+        )
 
     def __repr__(self) -> str:
         return f"QServeDeferredSplitFusedKvCache({self.report()})"

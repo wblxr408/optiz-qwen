@@ -100,6 +100,11 @@ def test_run_greedy_prefill_decode_passes_prepared_position_ids_to_decode() -> N
 class FakeDeferredCache:
     defer_prefill_cache_injection = True
 
+    class Config:
+        activation_threshold = 1
+
+    qserve_config = Config()
+
     def __init__(self) -> None:
         self.adopted = None
 
@@ -120,6 +125,49 @@ def test_run_greedy_prefill_decode_defers_custom_cache_until_after_native_prefil
     assert "past_key_values" not in model.calls[0]
     assert cache.adopted == {"step": 3}
     assert model.calls[1]["past_key_values"] is cache
+
+
+def test_run_greedy_prefill_decode_keeps_native_cache_below_kv_threshold() -> None:
+    class DelayedCache(FakeDeferredCache):
+        class Config:
+            activation_threshold = 99
+
+        qserve_config = Config()
+
+    model = FakeGreedyModel()
+    cache = DelayedCache()
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+    }
+
+    run_greedy_prefill_decode(model, inputs, max_new_tokens=2, tokenizer=object(), kv_cache=cache)
+
+    assert cache.adopted is None
+    assert model.calls[1]["past_key_values"] == {"step": 3}
+
+
+def test_run_greedy_prefill_decode_keeps_answer_prefix_native_before_activation() -> None:
+    class WarmupCache(FakeDeferredCache):
+        class Config:
+            activation_threshold = 1
+            decode_warmup_tokens = 3
+
+        qserve_config = Config()
+
+    model = FakeGreedyModel()
+    cache = WarmupCache()
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+    }
+
+    run_greedy_prefill_decode(model, inputs, max_new_tokens=5, tokenizer=object(), kv_cache=cache)
+
+    assert cache.adopted == {"step": 1}
+    assert model.calls[1]["past_key_values"] == {"step": 3}
+    assert model.calls[2]["past_key_values"] == {"step": 1}
+    assert model.calls[3]["past_key_values"] == {"step": 1}
 
 
 def test_run_greedy_prefill_decode_runs_post_prefill_callback_before_decode() -> None:

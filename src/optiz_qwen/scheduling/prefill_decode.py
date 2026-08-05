@@ -30,6 +30,7 @@ def run_greedy_prefill_decode(
     eos_token_id: int | None = None,
     kv_cache: Any | None = None,
     post_prefill_callback: Any | None = None,
+    post_decode_callback: Any | None = None,
 ) -> tuple[torch.Tensor, PrefillDecodeStats]:
     """Run a greedy prefill + token-by-token decode loop.
 
@@ -54,6 +55,21 @@ def run_greedy_prefill_decode(
     defer_prefill_cache = bool(
         kv_cache is not None and getattr(kv_cache, "defer_prefill_cache_injection", False)
     )
+    activation_threshold = int(
+        getattr(getattr(kv_cache, "qserve_config", None), "activation_threshold", 0)
+    )
+    decode_warmup_tokens = int(
+        getattr(getattr(kv_cache, "qserve_config", None), "decode_warmup_tokens", 0)
+    )
+    # Multiple-choice VLM answers often decide their option in the first few
+    # decode tokens.  Preserve those decision-critical tokens exactly on the
+    # native cache, then use packed KV only for a sufficiently long tail.
+    activate_after_prefill = (
+        defer_prefill_cache
+        and prompt_tokens >= activation_threshold
+        and decode_warmup_tokens <= 1
+    )
+    pending_deferred_activation = defer_prefill_cache and not activate_after_prefill
     if kv_cache is not None:
         if not defer_prefill_cache:
             prefill_inputs["past_key_values"] = kv_cache
@@ -85,7 +101,7 @@ def run_greedy_prefill_decode(
             elapsed_seconds=elapsed,
         )
 
-    if defer_prefill_cache:
+    if activate_after_prefill:
         if past_key_values is None:
             raise RuntimeError("native prefill did not return a cache for deferred qserve decode.")
         # This bookkeeping is required for decode, but it is not part of the
@@ -116,6 +132,20 @@ def run_greedy_prefill_decode(
         with torch.no_grad():
             decode_outputs = model(**decode_kwargs)
         past_key_values = getattr(decode_outputs, "past_key_values", past_key_values)
+        if (
+            pending_deferred_activation
+            and past_key_values is not None
+            and prompt_tokens + len(generated_ids) >= activation_threshold
+            and len(generated_ids) >= decode_warmup_tokens
+        ):
+            # Until this point the candidate is byte-for-byte on the native
+            # cache path.  Only adopt it once the real request reaches the
+            # experimentally selected packed-KV crossover.
+            kv_cache.adopt_native_prefill_cache(past_key_values)
+            past_key_values = kv_cache
+            pending_deferred_activation = False
+        if post_decode_callback is not None:
+            post_decode_callback()
         logits = decode_outputs.logits[:, -1, :]
         next_token = torch.argmax(logits, dim=-1)
         token_id = int(next_token.item())
