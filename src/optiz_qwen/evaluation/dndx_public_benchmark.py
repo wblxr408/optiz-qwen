@@ -515,7 +515,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     elapsed = time.perf_counter() - benchmark_start
     payload = {
-        "benchmark_version": "dndx_public_self_test_v1.1",
+        "benchmark_version": "dndx_public_self_test_v1.2",
         "timestamp": datetime.now().isoformat(),
         "dataset_path": str(dataset_path),
         "sample_count": len(samples),

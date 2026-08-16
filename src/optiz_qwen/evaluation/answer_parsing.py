@@ -4,20 +4,22 @@ from __future__ import annotations
 
 import re
 
+ANSWER_MARK = r"(?:\*{1,3}|_{1,3}|`{1,3})*"
+ANSWER_CHOICE = rf"{ANSWER_MARK}\s*[\(\[（【]?\s*([ABCD])\s*[\)\]）】]?\s*{ANSWER_MARK}"
 
 ANSWER_PATTERNS = [
     re.compile(
         r"(?:final\s*)?(?:answer|choice|option|答案|选项|选择|正确答案|最终答案)"
-        r"\s*(?:(?:is|为|是|[:：])\s*)*[\(\[（【]?\s*([ABCD])\s*[\)\]）】]?",
+        rf"\s*(?:(?:is|为|是|[:：])\s*)*{ANSWER_CHOICE}",
         re.IGNORECASE,
     ),
     re.compile(
         r"(?:我(?:会)?选|我认为(?:是)?|应(?:该)?选|请选择|选|答案为|答案是)"
-        r"\s*(?:[:：]\s*)?[\(\[（【]?\s*([ABCD])\s*[\)\]）】]?",
+        rf"\s*(?:[:：]\s*)?{ANSWER_CHOICE}",
         re.IGNORECASE,
     ),
     re.compile(
-        r"^\s*[\(\[（【]?\s*([ABCD])\s*[\)\]）】]?\s*(?:[\.。,:：\)\]）】\s]|$)",
+        rf"^\s*{ANSWER_CHOICE}\s*(?:[\.。,:：\)\]）】\s]|$)",
         re.IGNORECASE | re.MULTILINE,
     ),
 ]
@@ -36,8 +38,8 @@ def extract_answer(text: str) -> str | None:
 
 
 def parse_choice_answer(text: str, _choices: dict[str, str]) -> tuple[str | None, str]:
-    """Parse a benchmark answer using the official DNDX v1.1 rules."""
+    """Parse a benchmark answer using the official DNDX v1.2 rules."""
 
     answer = extract_answer(text)
-    source = "official_v1.1_pattern" if answer is not None else "missing_choice_answer"
+    source = "official_v1.2_pattern" if answer is not None else "missing_choice_answer"
     return answer, source

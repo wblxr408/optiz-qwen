@@ -47,6 +47,10 @@ def test_answer_extraction_and_metrics() -> None:
     assert extract_answer("我选 A") == "A"
     assert extract_answer("应该选【B】") == "B"
     assert extract_answer("Final choice is (C)") == "C"
+    assert extract_answer("正确答案是 **D**。") == "D"
+    assert extract_answer("*答案：* C *") == "C"
+    assert extract_answer("`Answer: A`") == "A"
+    assert extract_answer("**B**") == "B"
     assert extract_answer("no valid answer") is None
     assert round(compute_throughput(5, 0.2, 1.0), 3) == 5.0
 
