@@ -226,6 +226,13 @@ class VLMModel:
         return self.device
 
     def _resolve_torch_dtype(self, torch):
+        requested = os.environ.get("OPTIZ_QWEN_TORCH_DTYPE", "").strip().lower()
+        if requested in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        if requested in {"fp16", "float16"}:
+            return torch.float16
+        if requested in {"fp32", "float32"}:
+            return torch.float32
         if str(self._resolved_device).startswith("cuda"):
             return torch.float16
         return torch.float32
