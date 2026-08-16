@@ -41,6 +41,16 @@ $RECYCLE.BIN/
 .venv-*/
 *.egg-info/
 
+# Secrets and SSH keys (never commit)
+id_ed25519
+id_ed25519.pub
+id_rsa
+id_rsa.pub
+*.pem
+*.key
+.env
+.env.*
+
 # Local data and model artifacts
 resources/eval_dataset/raw/*
 resources/model_weights/raw/*
@@ -48,6 +58,10 @@ resources/ppu_docs/raw/*
 artifacts/*
 benchmarks/output/*
 reports/output/*
+
+# Ad-hoc sync bundles used to push working-tree files to the PPU box.  They are
+# rebuilt on demand and would otherwise land in the repo as binary noise.
+sync*.tar
 
 # Keep placeholders
 !resources/eval_dataset/raw/README.md

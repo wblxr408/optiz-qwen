@@ -17,7 +17,11 @@ from optiz_qwen.compression import (
     get_qwen35_tome_runtime,
     install_qwen35_tome,
 )
-from optiz_qwen.scheduling import build_kv_chain, run_greedy_prefill_decode
+from optiz_qwen.scheduling import (
+    build_kv_chain,
+    cuda_graph_decode_enabled,
+    run_greedy_prefill_decode,
+)
 
 
 @dataclass
@@ -66,6 +70,8 @@ class VLMModel:
         self._backend_name = "dummy"
         self._resolved_device = "cpu"
         self._resolved_dtype_name = "unloaded"
+        self._graph_decoder = None
+        self._graph_decode_report = None
 
         if backend in {"auto", "transformers"}:
             try:
@@ -286,6 +292,16 @@ class VLMModel:
                 "qserve_deferred_split_fused_kv requires OPTIZ_QWEN_GENERATION_RUNNER=greedy."
             )
         use_prefill_decode = generation_config.temperature == 0.0 and runner == "greedy"
+        graph_decoder = None
+        if use_prefill_decode and cuda_graph_decode_enabled():
+            if kv_chain is not None:
+                raise ValueError(
+                    "OPTIZ_QWEN_CUDA_GRAPH_DECODE cannot be combined with "
+                    "OPTIZ_QWEN_KV_CHAIN_ENABLED; the captured graph owns the decode loop "
+                    "and requires the StaticCache it was captured against."
+                )
+            graph_decoder = self._ensure_graph_decoder(inputs)
+            kv_chain = graph_decoder.cache
         if use_prefill_decode:
             if kv_chain is None:
                 from transformers.cache_utils import DynamicCache
@@ -311,6 +327,7 @@ class VLMModel:
                 kv_cache=kv_chain,
                 post_prefill_callback=post_prefill_callback,
                 post_decode_callback=post_decode_callback,
+                graph_decoder=graph_decoder,
             )
             first_chunk_at = start + runtime_stats.ttft_seconds
             chunks = []
@@ -425,12 +442,83 @@ class VLMModel:
                 ),
                 "kv_chain": kv_report.__dict__ if kv_report is not None else None,
                 "kv_runtime": cache_runtime,
+                "cuda_graph_decode": (
+                    self._graph_decode_report.to_dict()
+                    if getattr(self, "_graph_decode_report", None) is not None
+                    else None
+                ),
                 "prefill_decode_runtime": runtime_stats.__dict__ if runtime_stats is not None else None,
                 "answer_source": answer_source,
                 "raw_text": raw_text,
                 "choice_fallback": choice_fallback_meta,
             },
         )
+
+    def _ensure_graph_decoder(self, inputs):
+        """Build, prefill against, and capture the decode graph once per process.
+
+        The graph is captured while the config says ``decode_backend`` and the
+        config is then flipped back to ``prefill_backend``.  A captured graph
+        freezes the kernels that were live at capture time, so replay keeps
+        dispatching FA2 decode kernels while the uncaptured prefill pass
+        dispatches sdpa -- which is what wins both metrics at once.
+
+        Capture needs a cache holding a real prefill so the decode step sees
+        plausible state; those writes are discarded because
+        ``run_greedy_prefill_decode`` resets the cache before every request.
+        """
+
+        if self._graph_decoder is not None:
+            return self._graph_decoder
+
+        import torch
+
+        from optiz_qwen.kernels import (
+            attention_backend,
+            resolved_decode_backend,
+            resolved_prefill_backend,
+            set_attention_backend,
+        )
+        from optiz_qwen.scheduling import (
+            CudaGraphDecoder,
+            build_static_cache,
+            resolved_max_cache_len,
+            resolved_warmup_steps,
+        )
+
+        prefill_backend = resolved_prefill_backend()
+        decode_backend = resolved_decode_backend()
+        device = getattr(self._model, "device", self._resolved_device)
+        dtype = next(self._model.parameters()).dtype
+        cache = build_static_cache(
+            self._model,
+            max_cache_len=resolved_max_cache_len(),
+            device=device,
+            dtype=dtype,
+        )
+        decoder = CudaGraphDecoder(
+            self._model,
+            cache,
+            capture_backend=decode_backend,
+            warmup_steps=resolved_warmup_steps(),
+        )
+
+        prompt_tokens = int(inputs["input_ids"].shape[-1])
+        capture_inputs = dict(inputs)
+        capture_inputs["use_cache"] = True
+        capture_inputs["past_key_values"] = cache
+        capture_inputs["cache_position"] = torch.arange(prompt_tokens, device=device)
+        with torch.inference_mode():
+            with attention_backend(self._model, prefill_backend):
+                capture_outputs = self._model(**capture_inputs)
+            token_id = int(torch.argmax(capture_outputs.logits[:, -1, :], dim=-1).item())
+
+        decoder.capture(token_id=token_id, position=prompt_tokens, device=device)
+        set_attention_backend(self._model, prefill_backend)
+
+        self._graph_decoder = decoder
+        self._graph_decode_report = decoder.report(prefill_backend=prefill_backend)
+        return decoder
 
     def _build_kv_chain_if_enabled(self):
         enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower()

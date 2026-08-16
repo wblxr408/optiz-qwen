@@ -20,6 +20,7 @@ from PIL import Image
 
 from .answer_parsing import extract_answer, parse_choice_answer
 from .dndx_wrapper import GenerationConfig, VLMModel
+from ..scheduling import prefill_last_logit_only_enabled
 
 DEFAULT_DATASET_PATH = "./resources/eval_dataset/raw/mmbench_public/mmbench_dev_en.tsv"
 DEFAULT_MODEL_PATH = "./resources/model_weights/raw/Qwen3.5-2B"
@@ -43,6 +44,16 @@ TOME_ENV_KEYS = (
     "OPTIZ_QWEN_TOME_LAYER",
     "OPTIZ_QWEN_TOME_R",
     "OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION",
+)
+#: The validated PPU hybrid: sdpa prefill + one CUDA graph captured under
+#: flash_attention_2 replayed over a StaticCache.  Kept behind a switch so the
+#: A/B against the eager baseline stays a one-flag change.
+HYBRID_ENV_KEYS = (
+    "OPTIZ_QWEN_CUDA_GRAPH_DECODE",
+    "OPTIZ_QWEN_CUDA_GRAPH_MAX_CACHE_LEN",
+    "OPTIZ_QWEN_CUDA_GRAPH_WARMUP_STEPS",
+    "OPTIZ_QWEN_ATTN_PREFILL",
+    "OPTIZ_QWEN_ATTN_DECODE",
 )
 
 
@@ -137,6 +148,39 @@ def parse_args() -> argparse.Namespace:
         "--kv-chain-attention-backend",
         choices=["triton_int4_split_decode", "triton_int4_decode", "triton_int8_decode"],
         default="triton_int4_split_decode",
+    )
+    parser.add_argument(
+        "--enable-hybrid-cudagraph",
+        action="store_true",
+        help=(
+            "Enable the validated PPU hybrid decode path: sdpa prefill plus one "
+            "CUDA graph captured under flash_attention_2 replayed over a StaticCache. "
+            "Requires --generation-runner greedy."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-max-cache-len",
+        type=int,
+        default=2048,
+        help="StaticCache length the decode graph is captured against.",
+    )
+    parser.add_argument(
+        "--hybrid-warmup-steps",
+        type=int,
+        default=3,
+        help="Side-stream warmup decode steps run before graph capture.",
+    )
+    parser.add_argument(
+        "--hybrid-prefill-backend",
+        choices=["sdpa", "flash_attention_2", "eager"],
+        default="sdpa",
+        help="Attention backend restored after capture, used by prefill.",
+    )
+    parser.add_argument(
+        "--hybrid-decode-backend",
+        choices=["sdpa", "flash_attention_2"],
+        default="flash_attention_2",
+        help="Attention backend live at capture time, frozen into the graph.",
     )
     return parser.parse_args()
 
@@ -415,6 +459,36 @@ def tome_cli_environment(args: argparse.Namespace):
                 os.environ[key] = value
 
 
+@contextmanager
+def hybrid_cli_environment(args: argparse.Namespace):
+    previous = {key: os.environ.get(key) for key in HYBRID_ENV_KEYS}
+    if getattr(args, "enable_hybrid_cudagraph", False):
+        os.environ["OPTIZ_QWEN_CUDA_GRAPH_DECODE"] = "1"
+        os.environ["OPTIZ_QWEN_CUDA_GRAPH_MAX_CACHE_LEN"] = str(
+            getattr(args, "hybrid_max_cache_len", 2048)
+        )
+        os.environ["OPTIZ_QWEN_CUDA_GRAPH_WARMUP_STEPS"] = str(
+            getattr(args, "hybrid_warmup_steps", 3)
+        )
+        os.environ["OPTIZ_QWEN_ATTN_PREFILL"] = str(
+            getattr(args, "hybrid_prefill_backend", "sdpa")
+        )
+        os.environ["OPTIZ_QWEN_ATTN_DECODE"] = str(
+            getattr(args, "hybrid_decode_backend", "flash_attention_2")
+        )
+    else:
+        for key in HYBRID_ENV_KEYS:
+            os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def run_benchmark(args: argparse.Namespace) -> dict:
     benchmark_start = time.perf_counter()
     if getattr(args, "enable_kv_chain", False) and getattr(args, "generation_runner", "generate") != "greedy":
@@ -422,6 +496,17 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "qserve_deferred_split_fused_kv requires --generation-runner greedy; "
             "the native generate runner cannot install the fused decode path after prefill."
         )
+    if getattr(args, "enable_hybrid_cudagraph", False):
+        if getattr(args, "generation_runner", "generate") != "greedy":
+            raise ValueError(
+                "--enable-hybrid-cudagraph requires --generation-runner greedy; "
+                "the captured graph owns the decode loop."
+            )
+        if getattr(args, "enable_kv_chain", False):
+            raise ValueError(
+                "--enable-hybrid-cudagraph is mutually exclusive with --enable-kv-chain; "
+                "the graph is bound to the StaticCache it was captured against."
+            )
     random.seed(args.seed)
     try:
         import numpy as np
@@ -458,6 +543,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         runner_cli_environment(args),
         visual_cli_environment(args),
         tome_cli_environment(args),
+        hybrid_cli_environment(args),
     ):
         kv_chain_env_enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
         model = VLMModel(
@@ -574,6 +660,25 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "kv_chain_requested_by_cli": bool(getattr(args, "enable_kv_chain", False)),
             "kv_chain_enabled_by_env": kv_chain_env_enabled,
             "kv_chain_name": getattr(args, "kv_chain", None) if kv_chain_env_enabled else None,
+            "hybrid_cudagraph_enabled": bool(getattr(args, "enable_hybrid_cudagraph", False)),
+            "hybrid_max_cache_len": (
+                getattr(args, "hybrid_max_cache_len", None)
+                if getattr(args, "enable_hybrid_cudagraph", False)
+                else None
+            ),
+            "hybrid_prefill_backend": (
+                getattr(args, "hybrid_prefill_backend", None)
+                if getattr(args, "enable_hybrid_cudagraph", False)
+                else None
+            ),
+            "hybrid_decode_backend": (
+                getattr(args, "hybrid_decode_backend", None)
+                if getattr(args, "enable_hybrid_cudagraph", False)
+                else None
+            ),
+            # On by default; recorded here so an arm's TTFT number can never be
+            # read without knowing whether the last-logit-only prefill was live.
+            "prefill_last_logit_only": prefill_last_logit_only_enabled(),
         },
         "performance": {
             "avg_ttft_ms": round(sum(ttfts_ms) / len(ttfts_ms), 3) if ttfts_ms else None,

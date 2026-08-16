@@ -9,11 +9,14 @@ from optiz_qwen.evaluation.dndx_public_benchmark import (
     DEFAULT_DATASET_PATH,
     DEFAULT_MODEL_PATH,
     DEFAULT_OUTPUT_PATH,
+    HYBRID_ENV_KEYS,
     OFFICIAL_MAX_NEW_TOKENS,
     compute_throughput,
     extract_answer,
     fixed_generation_config,
+    hybrid_cli_environment,
     kv_chain_cli_environment,
+    run_benchmark,
     Sample,
     select_samples,
     runner_cli_environment,
@@ -160,6 +163,67 @@ def test_tome_cli_environment_is_explicit_and_scoped(monkeypatch) -> None:
         assert os.environ["OPTIZ_QWEN_TOME_LAYER"] == "8"
         assert os.environ["OPTIZ_QWEN_TOME_R"] == "2"
         assert os.environ["OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION"] == "1"
+
+
+def test_hybrid_cli_environment_sets_and_restores_env(monkeypatch) -> None:
+    import os
+
+    for key in HYBRID_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    args = Namespace(
+        enable_hybrid_cudagraph=True,
+        hybrid_max_cache_len=4096,
+        hybrid_warmup_steps=2,
+        hybrid_prefill_backend="sdpa",
+        hybrid_decode_backend="flash_attention_2",
+    )
+
+    with hybrid_cli_environment(args):
+        assert os.environ["OPTIZ_QWEN_CUDA_GRAPH_DECODE"] == "1"
+        assert os.environ["OPTIZ_QWEN_CUDA_GRAPH_MAX_CACHE_LEN"] == "4096"
+        assert os.environ["OPTIZ_QWEN_CUDA_GRAPH_WARMUP_STEPS"] == "2"
+        # The split is the whole point: capture under FA2, run prefill on sdpa.
+        assert os.environ["OPTIZ_QWEN_ATTN_PREFILL"] == "sdpa"
+        assert os.environ["OPTIZ_QWEN_ATTN_DECODE"] == "flash_attention_2"
+
+    for key in HYBRID_ENV_KEYS:
+        assert key not in os.environ
+
+
+def test_hybrid_cli_environment_disables_inherited_setting(monkeypatch) -> None:
+    import os
+
+    monkeypatch.setenv("OPTIZ_QWEN_CUDA_GRAPH_DECODE", "1")
+    monkeypatch.setenv("OPTIZ_QWEN_ATTN_DECODE", "flash_attention_2")
+
+    with hybrid_cli_environment(Namespace(enable_hybrid_cudagraph=False)):
+        assert "OPTIZ_QWEN_CUDA_GRAPH_DECODE" not in os.environ
+        assert "OPTIZ_QWEN_ATTN_DECODE" not in os.environ
+
+    assert os.environ["OPTIZ_QWEN_CUDA_GRAPH_DECODE"] == "1"
+    assert os.environ["OPTIZ_QWEN_ATTN_DECODE"] == "flash_attention_2"
+
+
+def test_hybrid_requires_the_greedy_runner() -> None:
+    args = Namespace(
+        enable_hybrid_cudagraph=True,
+        enable_kv_chain=False,
+        generation_runner="generate",
+    )
+
+    with pytest.raises(ValueError, match="requires --generation-runner greedy"):
+        run_benchmark(args)
+
+
+def test_hybrid_is_mutually_exclusive_with_the_kv_chain() -> None:
+    args = Namespace(
+        enable_hybrid_cudagraph=True,
+        enable_kv_chain=True,
+        generation_runner="greedy",
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        run_benchmark(args)
 
 
 def test_stratified_sample_selection_is_balanced_and_reproducible() -> None:

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from optiz_qwen.scheduling import run_greedy_prefill_decode
+from optiz_qwen.scheduling import (
+    PREFILL_LOGITS_TO_KEEP_ENV,
+    prefill_last_logit_only_enabled,
+    run_greedy_prefill_decode,
+)
 
 
 class FakeOutputs:
@@ -187,3 +191,114 @@ def test_run_greedy_prefill_decode_runs_post_prefill_callback_before_decode() ->
     )
 
     assert callback_state["calls"] == 1
+
+
+def test_prefill_last_logit_only_defaults_on_and_respects_the_kill_switch(monkeypatch) -> None:
+    monkeypatch.delenv(PREFILL_LOGITS_TO_KEEP_ENV, raising=False)
+    assert prefill_last_logit_only_enabled() is True
+    for value in ("1", "true", "YES", "on"):
+        monkeypatch.setenv(PREFILL_LOGITS_TO_KEEP_ENV, value)
+        assert prefill_last_logit_only_enabled() is True
+    for value in ("0", "false", "no", "off"):
+        monkeypatch.setenv(PREFILL_LOGITS_TO_KEEP_ENV, value)
+        assert prefill_last_logit_only_enabled() is False
+
+
+def test_prefill_requests_only_the_last_logit_row(monkeypatch) -> None:
+    """Greedy prefill reads ``logits[:, -1, :]``, so the lm_head only needs one row.
+
+    On PPU the full-sequence projection costs 3.04 ms of a ~52 ms prefill at
+    vocab 248320; asking for one position removes that from TTFT.
+    """
+
+    monkeypatch.delenv(PREFILL_LOGITS_TO_KEEP_ENV, raising=False)
+    model = FakeGreedyModel()
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+    }
+
+    _, stats = run_greedy_prefill_decode(model, inputs, max_new_tokens=2, tokenizer=object())
+
+    assert model.calls[0]["logits_to_keep"] == 1
+    assert stats.prefill_logits_trimmed is True
+    # Decode already runs one position at a time; trimming there would be noise.
+    assert "logits_to_keep" not in model.calls[1]
+
+
+def test_prefill_keeps_full_logits_when_the_switch_is_off(monkeypatch) -> None:
+    monkeypatch.setenv(PREFILL_LOGITS_TO_KEEP_ENV, "0")
+    model = FakeGreedyModel()
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+    }
+
+    _, stats = run_greedy_prefill_decode(model, inputs, max_new_tokens=2, tokenizer=object())
+
+    assert "logits_to_keep" not in model.calls[0]
+    assert stats.prefill_logits_trimmed is False
+
+
+class FakeStrictSignatureModel(FakeGreedyModel):
+    """A model whose forward has no ``logits_to_keep`` and no ``**kwargs``."""
+
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=True):
+        return FakeGreedyModel.__call__(
+            self,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+
+    def __call__(self, **kwargs):
+        return self.forward(**kwargs)
+
+
+def test_prefill_skips_trimming_when_the_model_cannot_accept_it(monkeypatch) -> None:
+    """The probe is by signature, so an unsupported model never raises mid-prefill."""
+
+    monkeypatch.delenv(PREFILL_LOGITS_TO_KEEP_ENV, raising=False)
+    model = FakeStrictSignatureModel()
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+    }
+
+    _, stats = run_greedy_prefill_decode(model, inputs, max_new_tokens=2, tokenizer=object())
+
+    assert "logits_to_keep" not in model.calls[0]
+    assert stats.prefill_logits_trimmed is False
+
+
+class FakeTrimmingModel(FakeGreedyModel):
+    """Honors ``logits_to_keep`` the way ``modeling_qwen3_5`` does."""
+
+    def __call__(self, **kwargs):
+        outputs = FakeGreedyModel.__call__(self, **kwargs)
+        keep = kwargs.get("logits_to_keep")
+        if keep:
+            outputs.logits = outputs.logits[:, -keep:, :]
+        return outputs
+
+
+def test_trimmed_prefill_yields_the_same_first_token(monkeypatch) -> None:
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+    }
+
+    monkeypatch.setenv(PREFILL_LOGITS_TO_KEEP_ENV, "0")
+    full_ids, full_stats = run_greedy_prefill_decode(
+        FakeTrimmingModel(), inputs, max_new_tokens=4, tokenizer=object()
+    )
+
+    monkeypatch.setenv(PREFILL_LOGITS_TO_KEEP_ENV, "1")
+    trimmed_ids, trimmed_stats = run_greedy_prefill_decode(
+        FakeTrimmingModel(), inputs, max_new_tokens=4, tokenizer=object()
+    )
+
+    assert full_stats.prefill_logits_trimmed is False
+    assert trimmed_stats.prefill_logits_trimmed is True
+    assert torch.equal(full_ids, trimmed_ids)
