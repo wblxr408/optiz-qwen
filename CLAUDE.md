@@ -75,9 +75,10 @@ gain to date comes from three things only:
   positions at vocab 248320 when greedy reads one; `logits_to_keep=1` is worth
   +5.10% TTFT on top of the graph
 
-Both run on the CUDA-compatible shim, not on PPU-native code. When describing
-results, say "validated on PPU hardware" (true) and not "PPU-adapted kernels"
-(false). The measured bottleneck on this hardware is CPU kernel dispatch, not
+Both execute on PPU hardware through the PPU-provided CUDA-compatible runtime/API;
+they do not use PPU-native custom kernels. When describing results, say
+"validated on PPU hardware" (true) and not "PPU-adapted kernels" (false). The
+measured bottleneck on this hardware is CPU kernel dispatch, not
 HBM bandwidth — **for prefill as well as decode** (`cpu_issue_fraction` 0.988+
 on both). This is why `causal_conv1d`, once built, changed nothing. See
 `docs/README.md` and `docs/ppu_optimization_design.md`.

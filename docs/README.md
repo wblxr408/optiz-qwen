@@ -204,7 +204,7 @@ dispatch-bound 的负载下，减少每次访存的字节数不会减少 kernel 
 
 > 第 7 步（PPU 原生内核开发）**尚未开始**。当前全部收益来自 dispatch 消除
 > （CUDA Graph）、注意力后端选择、以及去掉 prefill 里多余的 lm_head 投影，
-> 运行在 CUDA 兼容 shim 之上，不含任何 PPU 原生算子。
+> 这些路径是在 PPU 硬件上通过其 CUDA 兼容运行时执行的，不含任何 PPU 原生自定义算子。
 
 ## 当前推荐提交版本
 

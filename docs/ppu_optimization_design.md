@@ -483,8 +483,8 @@ torch 2.9.0 · triton 3.5.0 (works; `tl.dot` bit-exact, 103.6 TFLOP/s, 10.5 µs 
 transformers 5.14.1 · flash-attn 2.7.4.post1 (+ flash-attn-3 3.0.0b1) · flashinfer 0.6.4 ·
 torchao 0.11.0 · vllm 0.17.1+cu130 (sees the device as `NvmlCudaPlatform`) · nvcc CUDA 13.0 ·
 `fla-core` 0.5.2 · `causal_conv1d` 1.6.2.post1 (built from source on the target).
-Device: PPU-ZW810E, sm_80 shim, 64 SMs, 256 KB shared/SM, 64 MB L2, 97920 MiB HBM,
-measured 2011 GB/s.
+Device: PPU-ZW810E, PPU runtime reporting an sm_80-compatible execution target,
+64 SMs, 256 KB shared/SM, 64 MB L2, 97920 MiB HBM, measured 2011 GB/s.
 
 Model geometry: 24 layers = 18 `linear_attention` (GatedDeltaNet) + 6 `full_attention`
 (`full_attention_interval: 4`), GQA 8Q:2KV, head_dim 256, hidden 2048, intermediate 6144,

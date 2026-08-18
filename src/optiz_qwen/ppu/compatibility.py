@@ -16,9 +16,9 @@ What was validated is narrow and deliberately stated as such: sdpa prefill plus
 one CUDA graph captured under ``flash_attention_2`` and replayed over a
 ``StaticCache``, the ``fla-core`` Triton gated-delta-net path with
 ``causal_conv1d`` available, and a last-position-only prefill lm_head.
-That is *scheduling, backend selection, and redundant-work removal on a
-CUDA-compatible shim*, not PPU native kernel work -- stage 7 of the execution
-order in CLAUDE.md is untouched.
+That is *scheduling, backend selection, and redundant-work removal on PPU hardware
+through its CUDA-compatible runtime/API*, not PPU-native custom kernel work --
+stage 7 of the execution order in CLAUDE.md is untouched.
 
 Prefill was additionally measured to be dispatch-bound on this device
 (``cpu_issue_fraction`` 0.988+), the same diagnosis decode had.  That is a
