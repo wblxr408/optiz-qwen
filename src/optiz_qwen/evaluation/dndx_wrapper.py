@@ -70,6 +70,8 @@ class VLMModel:
         self._backend_name = "dummy"
         self._resolved_device = "cpu"
         self._resolved_dtype_name = "unloaded"
+        self._processor_load_time_sec = None
+        self._model_load_time_sec = None
         self._graph_decoder = None
         self._graph_decode_report = None
 
@@ -91,6 +93,14 @@ class VLMModel:
     @property
     def dtype_name(self) -> str:
         return self._resolved_dtype_name
+
+    @property
+    def processor_load_time_sec(self) -> float | None:
+        return self._processor_load_time_sec
+
+    @property
+    def model_load_time_sec(self) -> float | None:
+        return self._model_load_time_sec
 
     @property
     def quantization_config(self):
@@ -134,11 +144,13 @@ class VLMModel:
         self._install_transformers_log_filters()
         self._torch = torch
         self._resolved_device = self._resolve_torch_device(torch)
+        processor_load_start = time.perf_counter()
         self._processor = AutoProcessor.from_pretrained(
             self.model_path,
             local_files_only=True,
             trust_remote_code=True,
         )
+        self._processor_load_time_sec = time.perf_counter() - processor_load_start
         self._configure_visual_token_budget()
         torch_dtype = self._resolve_torch_dtype(torch)
         self._resolved_dtype_name = {
@@ -146,6 +158,7 @@ class VLMModel:
             torch.float16: "fp16",
             torch.float32: "fp32",
         }.get(torch_dtype, str(torch_dtype).removeprefix("torch."))
+        model_load_start = time.perf_counter()
         self._model = AutoModelForMultimodalLM.from_pretrained(
             self.model_path,
             local_files_only=True,
@@ -155,6 +168,7 @@ class VLMModel:
         if self._resolved_device != "cpu":
             self._model = self._model.to(self._resolved_device)
         self._model = self._model.eval()
+        self._model_load_time_sec = time.perf_counter() - model_load_start
         self._configure_tome()
         self._tokenizer = getattr(self._processor, "tokenizer", None)
 

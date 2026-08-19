@@ -332,6 +332,102 @@ def compute_throughput(
     return effective_tokens / decode_window
 
 
+def _linear_percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile / 100.0
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _build_runtime_metrics(
+    latencies_seconds: list[float],
+    output_token_counts: list[int],
+    *,
+    processor_load_time_sec: float | None,
+    model_load_time_sec: float | None,
+) -> dict:
+    latencies_ms = [value * 1000.0 for value in latencies_seconds]
+    total_output_tokens = sum(output_token_counts)
+    total_generation_time_sec = sum(latencies_seconds)
+    latency_mean_ms = (
+        sum(latencies_ms) / len(latencies_ms) if latencies_ms else None
+    )
+    aggregate_output_tokens_per_sec = (
+        total_output_tokens / total_generation_time_sec
+        if total_generation_time_sec > 0
+        else 0.0
+    )
+    return {
+        "processor_load_time_sec": (
+            round(processor_load_time_sec, 3)
+            if processor_load_time_sec is not None
+            else None
+        ),
+        "model_load_time_sec": (
+            round(model_load_time_sec, 3)
+            if model_load_time_sec is not None
+            else None
+        ),
+        "latency_mean_ms": (
+            round(latency_mean_ms, 3) if latency_mean_ms is not None else None
+        ),
+        "latency_p50_ms": (
+            round(value, 3)
+            if (value := _linear_percentile(latencies_ms, 50.0)) is not None
+            else None
+        ),
+        "latency_p95_ms": (
+            round(value, 3)
+            if (value := _linear_percentile(latencies_ms, 95.0)) is not None
+            else None
+        ),
+        "total_output_tokens": total_output_tokens,
+        "total_generation_time_sec": round(total_generation_time_sec, 3),
+        "aggregate_output_tokens_per_sec": round(
+            aggregate_output_tokens_per_sec, 3
+        ),
+    }
+
+
+def _cuda_memory_gb(model: VLMModel, metric_name: str) -> float | None:
+    torch_mod = getattr(model, "_torch", None)
+    device = getattr(model, "_resolved_device", None)
+    if torch_mod is None or str(device).split(":", 1)[0] != "cuda":
+        return None
+    cuda = getattr(torch_mod, "cuda", None)
+    metric = getattr(cuda, metric_name, None)
+    if not callable(metric):
+        return None
+    try:
+        return float(metric(device)) / (1024**3)
+    except Exception:
+        return None
+
+
+def _reset_cuda_peak_memory_stats(model: VLMModel) -> bool:
+    torch_mod = getattr(model, "_torch", None)
+    device = getattr(model, "_resolved_device", None)
+    if torch_mod is None or str(device).split(":", 1)[0] != "cuda":
+        return False
+    cuda = getattr(torch_mod, "cuda", None)
+    empty_cache = getattr(cuda, "empty_cache", None)
+    reset_peak_memory_stats = getattr(cuda, "reset_peak_memory_stats", None)
+    if not callable(empty_cache) or not callable(reset_peak_memory_stats):
+        return False
+    try:
+        empty_cache()
+        reset_peak_memory_stats(device)
+    except Exception:
+        return False
+    return True
+
+
 def settle_runtime(model: VLMModel) -> None:
     torch_mod = getattr(model, "_torch", None)
     if torch_mod is None:
@@ -552,6 +648,8 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             device=args.device,
             dtype=getattr(args, "dtype", None),
         )
+        after_load_allocated_gb = _cuda_memory_gb(model, "memory_allocated")
+        after_load_reserved_gb = _cuda_memory_gb(model, "memory_reserved")
 
         for sample in samples[: min(args.warmup_samples, len(samples))]:
             settle_runtime(model)
@@ -564,9 +662,13 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             )
             settle_runtime(model)
 
+        peak_memory_stats_reset = _reset_cuda_peak_memory_stats(model)
+
         records = []
         ttfts_ms = []
         throughputs = []
+        latencies_seconds = []
+        output_token_counts = []
         correct = 0
         validation_errors = 0
 
@@ -587,6 +689,8 @@ def run_benchmark(args: argparse.Namespace) -> dict:
                 result.token_count,
                 config.max_new_tokens,
             )
+            latencies_seconds.append(result.elapsed_seconds)
+            output_token_counts.append(result.token_count)
             validation_errors += int(bool(errors))
             is_correct = parsed_answer == sample.answer
             correct += int(is_correct)
@@ -618,7 +722,24 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             )
             settle_runtime(model)
 
+        peak_allocated_gb = (
+            _cuda_memory_gb(model, "max_memory_allocated")
+            if peak_memory_stats_reset
+            else None
+        )
+        peak_reserved_gb = (
+            _cuda_memory_gb(model, "max_memory_reserved")
+            if peak_memory_stats_reset
+            else None
+        )
+
     elapsed = time.perf_counter() - benchmark_start
+    runtime_metrics = _build_runtime_metrics(
+        latencies_seconds,
+        output_token_counts,
+        processor_load_time_sec=model.processor_load_time_sec,
+        model_load_time_sec=model.model_load_time_sec,
+    )
     payload = {
         "benchmark_version": "dndx_public_self_test_v1.1",
         "timestamp": datetime.now().isoformat(),
@@ -684,6 +805,29 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "avg_ttft_ms": round(sum(ttfts_ms) / len(ttfts_ms), 3) if ttfts_ms else None,
             "avg_throughput_tokens_per_sec": (
                 round(sum(throughputs) / len(throughputs), 3) if throughputs else 0.0
+            ),
+        },
+        "runtime_metrics": runtime_metrics,
+        "memory_metrics": {
+            "after_load_allocated_gb": (
+                round(after_load_allocated_gb, 3)
+                if after_load_allocated_gb is not None
+                else None
+            ),
+            "after_load_reserved_gb": (
+                round(after_load_reserved_gb, 3)
+                if after_load_reserved_gb is not None
+                else None
+            ),
+            "peak_allocated_gb": (
+                round(peak_allocated_gb, 3)
+                if peak_allocated_gb is not None
+                else None
+            ),
+            "peak_reserved_gb": (
+                round(peak_reserved_gb, 3)
+                if peak_reserved_gb is not None
+                else None
             ),
         },
         "timing": {
