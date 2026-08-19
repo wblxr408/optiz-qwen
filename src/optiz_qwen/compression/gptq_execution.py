@@ -20,9 +20,45 @@ OPTION_KEYS = ("A", "B", "C", "D")
 PERFORMANCE_CLAIM = "not_benchmarked"
 
 
+def _install_torch_accelerator_memory_info_compat(torch_module: Any) -> bool:
+    """Backfill the PyTorch 2.10 accelerator memory API on CUDA backends."""
+
+    accelerator = getattr(torch_module, "accelerator", None)
+    if accelerator is None or hasattr(accelerator, "get_memory_info"):
+        return False
+
+    cuda = getattr(torch_module, "cuda", None)
+    if cuda is None:
+        return False
+
+    is_available = getattr(cuda, "is_available", None)
+    mem_get_info = getattr(cuda, "mem_get_info", None)
+    current_accelerator = getattr(accelerator, "current_accelerator", None)
+    if (
+        not callable(is_available)
+        or not is_available()
+        or not callable(mem_get_info)
+        or not callable(current_accelerator)
+    ):
+        return False
+
+    current_device = current_accelerator()
+    if getattr(current_device, "type", None) != "cuda":
+        return False
+
+    def _get_memory_info(device_index: Any = None) -> tuple[int, int]:
+        return mem_get_info(device_index)
+
+    setattr(accelerator, "get_memory_info", _get_memory_info)
+    return True
+
+
 def _load_gptq_interfaces() -> tuple[Any, ...]:
     try:
         import torch
+
+        _install_torch_accelerator_memory_info_compat(torch)
+
         from torch.utils.data import DataLoader
         from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
