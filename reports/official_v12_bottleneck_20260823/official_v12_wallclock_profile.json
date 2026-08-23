@@ -1,0 +1,43 @@
+{
+  "backend": "official_v1.2_wrapper_untouched",
+  "torch": "2.9.0",
+  "samples": [
+    {
+      "index": "252",
+      "prompt_tokens": 162,
+      "prefill_ms": 352.62439807411283,
+      "decode_ms": [],
+      "n_forward": 0,
+      "ttft_streamer_ms": 115.56721897795796,
+      "elapsed_s": 0.4206490140641108
+    },
+    {
+      "index": "254",
+      "prompt_tokens": 149,
+      "prefill_ms": 224.20154104474932,
+      "decode_ms": [],
+      "n_forward": 0,
+      "ttft_streamer_ms": 110.59763294178993,
+      "elapsed_s": 0.2874103019712493
+    }
+  ],
+  "prefill_ms": {
+    "mean": 288.4129695594311,
+    "samples": [
+      352.62439807411283,
+      224.20154104474932
+    ]
+  },
+  "decode_step_ms": {
+    "mean": null,
+    "median": null,
+    "count": 0,
+    "samples": []
+  },
+  "decode_tokens_per_s": null,
+  "hbm": {
+    "weights_gb": 4.548,
+    "floor_ms_per_token": 4.548,
+    "theoretical_tokens_per_s": 219.9
+  }
+}
