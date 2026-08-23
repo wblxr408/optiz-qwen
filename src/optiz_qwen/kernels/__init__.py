@@ -25,3 +25,11 @@ __all__ = [
     "qwen35_chunk_delta_reference",
     "triton_int4_decode_available",
 ]
+
+from .attention_backend import (
+    attention_backend,
+    resolved_decode_backend,
+    resolved_prefill_backend,
+    set_attention_backend,
+)
+__all__ += ["attention_backend", "resolved_decode_backend", "resolved_prefill_backend", "set_attention_backend"]

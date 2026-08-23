@@ -19,7 +19,14 @@ from pathlib import Path
 from PIL import Image
 
 from .answer_parsing import extract_answer, parse_choice_answer
+from .diagnostics import (
+    install_crash_diagnostics,
+    log_runtime_environment,
+    stage,
+)
 from .dndx_wrapper import GenerationConfig, VLMModel
+from ..scheduling import prefill_last_logit_only_enabled
+from ..ppu import ensure_ppu_sdk_env
 
 DEFAULT_DATASET_PATH = "./resources/eval_dataset/raw/mmbench_public/mmbench_dev_en.tsv"
 DEFAULT_MODEL_PATH = "./resources/model_weights/raw/Qwen3.5-2B"
@@ -32,6 +39,9 @@ KV_CHAIN_ENV_KEYS = (
     "OPTIZ_QWEN_KV_CHAIN_V_BITS",
     "OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE",
     "OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH",
+    "OPTIZ_QWEN_KV_CHAIN_ACTIVATION_THRESHOLD",
+    "OPTIZ_QWEN_KV_CHAIN_DECODE_WARMUP_TOKENS",
+    "OPTIZ_QWEN_KV_CHAIN_ATTENTION_BACKEND",
 )
 RUNNER_ENV_KEYS = ("OPTIZ_QWEN_GENERATION_RUNNER",)
 VISUAL_ENV_KEYS = ("OPTIZ_QWEN_VISUAL_PIXEL_BUDGET",)
@@ -41,11 +51,15 @@ TOME_ENV_KEYS = (
     "OPTIZ_QWEN_TOME_R",
     "OPTIZ_QWEN_TOME_PROPORTIONAL_ATTENTION",
 )
-GDN_PROJECTION_ENV_KEYS = ("OPTIZ_QWEN_GDN_DECODE_PROJECTION_FUSION",)
-PPU_DELTA_ENV_KEYS = (
-    "OPTIZ_QWEN_PPU_DELTA_KERNEL",
-    "OPTIZ_QWEN_PPU_DELTA_KERNEL_LAYERS",
-    "OPTIZ_QWEN_PPU_DELTA_KERNEL_POSITION",
+#: The validated PPU hybrid: sdpa prefill + one CUDA graph captured under
+#: flash_attention_2 replayed over a StaticCache.  Kept behind a switch so the
+#: A/B against the eager baseline stays a one-flag change.
+HYBRID_ENV_KEYS = (
+    "OPTIZ_QWEN_CUDA_GRAPH_DECODE",
+    "OPTIZ_QWEN_CUDA_GRAPH_MAX_CACHE_LEN",
+    "OPTIZ_QWEN_CUDA_GRAPH_WARMUP_STEPS",
+    "OPTIZ_QWEN_ATTN_PREFILL",
+    "OPTIZ_QWEN_ATTN_DECODE",
 )
 
 
@@ -91,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--dtype",
+        choices=["bf16", "fp16"],
+        default=None,
+        help="Override model floating-point dtype; omitted preserves legacy behavior.",
+    )
     parser.add_argument("--warmup-samples", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=OFFICIAL_MAX_NEW_TOKENS)
     parser.add_argument(
@@ -104,14 +124,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tome-layer", type=int, default=12)
     parser.add_argument("--tome-r", type=int, default=1)
     parser.add_argument("--tome-proportional-attention", action="store_true")
-    parser.add_argument("--enable-gdn-decode-projection-fusion", action="store_true")
-    parser.add_argument("--enable-ppu-delta-kernel", action="store_true")
-    parser.add_argument("--ppu-delta-kernel-layers", type=int, default=9)
-    parser.add_argument(
-        "--ppu-delta-kernel-position",
-        choices=["first", "last"],
-        default="last",
-    )
     parser.add_argument(
         "--enable-kv-chain",
         action="store_true",
@@ -126,6 +138,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-chain-v-bits", type=int, default=4)
     parser.add_argument("--kv-chain-group-size", type=int, default=32)
     parser.add_argument("--kv-chain-residual-length", type=int, default=32)
+    parser.add_argument(
+        "--kv-chain-activation-threshold",
+        type=int,
+        default=1024,
+        help="Keep native dense decode below this real KV-token threshold.",
+    )
+    parser.add_argument(
+        "--kv-chain-decode-warmup-tokens",
+        type=int,
+        default=4,
+        help="Keep initial answer-forming decode tokens on the native cache.",
+    )
+    parser.add_argument(
+        "--kv-chain-attention-backend",
+        choices=["triton_int4_split_decode", "triton_int4_decode", "triton_int8_decode"],
+        default="triton_int4_split_decode",
+    )
+    parser.add_argument(
+        "--enable-hybrid-cudagraph",
+        action="store_true",
+        help=(
+            "Enable the validated PPU hybrid decode path: sdpa prefill plus one "
+            "CUDA graph captured under flash_attention_2 replayed over a StaticCache. "
+            "Requires --generation-runner greedy."
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-max-cache-len",
+        type=int,
+        default=2048,
+        help="StaticCache length the decode graph is captured against.",
+    )
+    parser.add_argument(
+        "--hybrid-warmup-steps",
+        type=int,
+        default=3,
+        help="Side-stream warmup decode steps run before graph capture.",
+    )
+    parser.add_argument(
+        "--hybrid-prefill-backend",
+        choices=["sdpa", "flash_attention_2", "eager"],
+        default="sdpa",
+        help="Attention backend restored after capture, used by prefill.",
+    )
+    parser.add_argument(
+        "--hybrid-decode-backend",
+        choices=["sdpa", "flash_attention_2"],
+        default="flash_attention_2",
+        help="Attention backend live at capture time, frozen into the graph.",
+    )
     return parser.parse_args()
 
 
@@ -227,6 +289,43 @@ def fixed_generation_config(
     return GenerationConfig(max_new_tokens=max_new_tokens, temperature=0.0, top_p=1.0)
 
 
+def _json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "to_dict"):
+        return _json_safe(value.to_dict())
+    return str(value)
+
+
+def quantization_metadata(quantization_config) -> dict:
+    config = _json_safe(quantization_config)
+    if not isinstance(config, dict):
+        return {
+            "enabled": False,
+            "quant_method": None,
+            "format": None,
+            "status": None,
+            "weights": None,
+            "config": config,
+        }
+
+    config_groups = config.get("config_groups") or {}
+    first_group = next(iter(config_groups.values()), {})
+    weights = first_group.get("weights") if isinstance(first_group, dict) else None
+    return {
+        "enabled": True,
+        "quant_method": config.get("quant_method"),
+        "format": config.get("format"),
+        "status": config.get("quantization_status"),
+        "weights": weights,
+        "config": config,
+    }
+
+
 def compute_throughput(
     token_count: int,
     ttft_seconds: float,
@@ -291,6 +390,15 @@ def kv_chain_cli_environment(args: argparse.Namespace):
         os.environ["OPTIZ_QWEN_KV_CHAIN_V_BITS"] = str(getattr(args, "kv_chain_v_bits", 4))
         os.environ["OPTIZ_QWEN_KV_CHAIN_GROUP_SIZE"] = str(getattr(args, "kv_chain_group_size", 32))
         os.environ["OPTIZ_QWEN_KV_CHAIN_RESIDUAL_LENGTH"] = str(getattr(args, "kv_chain_residual_length", 32))
+        os.environ["OPTIZ_QWEN_KV_CHAIN_ACTIVATION_THRESHOLD"] = str(
+            getattr(args, "kv_chain_activation_threshold", 1024)
+        )
+        os.environ["OPTIZ_QWEN_KV_CHAIN_DECODE_WARMUP_TOKENS"] = str(
+            getattr(args, "kv_chain_decode_warmup_tokens", 4)
+        )
+        os.environ["OPTIZ_QWEN_KV_CHAIN_ATTENTION_BACKEND"] = str(
+            getattr(args, "kv_chain_attention_backend", "triton_int4_split_decode")
+        )
     else:
         for key in KV_CHAIN_ENV_KEYS:
             os.environ.pop(key, None)
@@ -358,36 +466,24 @@ def tome_cli_environment(args: argparse.Namespace):
 
 
 @contextmanager
-def gdn_projection_cli_environment(args: argparse.Namespace):
-    previous = {key: os.environ.get(key) for key in GDN_PROJECTION_ENV_KEYS}
-    if getattr(args, "enable_gdn_decode_projection_fusion", False):
-        os.environ["OPTIZ_QWEN_GDN_DECODE_PROJECTION_FUSION"] = "1"
-    else:
-        for key in GDN_PROJECTION_ENV_KEYS:
-            os.environ.pop(key, None)
-    try:
-        yield
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-
-@contextmanager
-def ppu_delta_cli_environment(args: argparse.Namespace):
-    previous = {key: os.environ.get(key) for key in PPU_DELTA_ENV_KEYS}
-    if getattr(args, "enable_ppu_delta_kernel", False):
-        os.environ["OPTIZ_QWEN_PPU_DELTA_KERNEL"] = "1"
-        os.environ["OPTIZ_QWEN_PPU_DELTA_KERNEL_LAYERS"] = str(
-            getattr(args, "ppu_delta_kernel_layers", 9)
+def hybrid_cli_environment(args: argparse.Namespace):
+    previous = {key: os.environ.get(key) for key in HYBRID_ENV_KEYS}
+    if getattr(args, "enable_hybrid_cudagraph", False):
+        os.environ["OPTIZ_QWEN_CUDA_GRAPH_DECODE"] = "1"
+        os.environ["OPTIZ_QWEN_CUDA_GRAPH_MAX_CACHE_LEN"] = str(
+            getattr(args, "hybrid_max_cache_len", 2048)
         )
-        os.environ["OPTIZ_QWEN_PPU_DELTA_KERNEL_POSITION"] = str(
-            getattr(args, "ppu_delta_kernel_position", "last")
+        os.environ["OPTIZ_QWEN_CUDA_GRAPH_WARMUP_STEPS"] = str(
+            getattr(args, "hybrid_warmup_steps", 3)
+        )
+        os.environ["OPTIZ_QWEN_ATTN_PREFILL"] = str(
+            getattr(args, "hybrid_prefill_backend", "sdpa")
+        )
+        os.environ["OPTIZ_QWEN_ATTN_DECODE"] = str(
+            getattr(args, "hybrid_decode_backend", "flash_attention_2")
         )
     else:
-        for key in PPU_DELTA_ENV_KEYS:
+        for key in HYBRID_ENV_KEYS:
             os.environ.pop(key, None)
     try:
         yield
@@ -406,6 +502,17 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "qserve_deferred_split_fused_kv requires --generation-runner greedy; "
             "the native generate runner cannot install the fused decode path after prefill."
         )
+    if getattr(args, "enable_hybrid_cudagraph", False):
+        if getattr(args, "generation_runner", "generate") != "greedy":
+            raise ValueError(
+                "--enable-hybrid-cudagraph requires --generation-runner greedy; "
+                "the captured graph owns the decode loop."
+            )
+        if getattr(args, "enable_kv_chain", False):
+            raise ValueError(
+                "--enable-hybrid-cudagraph is mutually exclusive with --enable-kv-chain; "
+                "the graph is bound to the StaticCache it was captured against."
+            )
     random.seed(args.seed)
     try:
         import numpy as np
@@ -420,6 +527,26 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     output_path = Path(args.output).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Point the PPU RTC toolchain at its SDK before any device work.  On a shell
+    # that never sourced envsetup.sh, PPU_SDK/PPU_HOME are unset and the first
+    # kernel compilation aborts (rc=134 / SIGABRT) in the vision tower with no
+    # JSON and no traceback -- the reported smoke-test symptom.  No-op when the
+    # env is already set or no SDK is installed (e.g. non-PPU dev hosts).
+    sdk_bootstrap = ensure_ppu_sdk_env()
+    # Arm crash diagnostics before any device work: a native abort in the
+    # runtime (rc=134 / SIGABRT) unwinds nothing, so without this the process
+    # dies with no JSON and no traceback.  faulthandler dumps every thread's
+    # Python stack at abort, and the stage markers below survive it.
+    fault_log = install_crash_diagnostics(output_path)
+    if fault_log is not None:
+        stage(f"benchmark start; fault log -> {fault_log}")
+        if sdk_bootstrap.applied:
+            stage(
+                f"ppu sdk env bootstrapped from {sdk_bootstrap.sdk_root} "
+                f"({', '.join(sorted(sdk_bootstrap.variables_set))})"
+            )
+        else:
+            stage(f"ppu sdk env: {sdk_bootstrap.reason}")
     all_samples = load_mmbench_tsv(dataset_path)
     category_filter = None
     if getattr(args, "categories", None):
@@ -442,14 +569,21 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         runner_cli_environment(args),
         visual_cli_environment(args),
         tome_cli_environment(args),
-        gdn_projection_cli_environment(args),
-        ppu_delta_cli_environment(args),
+        hybrid_cli_environment(args),
     ):
         kv_chain_env_enabled = os.environ.get("OPTIZ_QWEN_KV_CHAIN_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
-        model = VLMModel(args.model_path, backend=args.backend, device=args.device)
+        stage(f"loading model backend={args.backend} device={args.device}")
+        model = VLMModel(
+            args.model_path,
+            backend=args.backend,
+            device=args.device,
+            dtype=getattr(args, "dtype", None),
+        )
+        log_runtime_environment(model)
 
-        for sample in samples[: min(args.warmup_samples, len(samples))]:
+        for warmup_index, sample in enumerate(samples[: min(args.warmup_samples, len(samples))]):
             settle_runtime(model)
+            stage(f"warmup {warmup_index} sample_id={sample.sample_id} (vision+prefill)")
             model.generate_with_metrics(
                 image=decode_image(sample.image_b64),
                 prompt=build_prompt(sample),
@@ -458,6 +592,7 @@ def run_benchmark(args: argparse.Namespace) -> dict:
                 sample_id=sample.sample_id,
             )
             settle_runtime(model)
+        stage("warmup complete")
 
         records = []
         ttfts_ms = []
@@ -465,8 +600,9 @@ def run_benchmark(args: argparse.Namespace) -> dict:
         correct = 0
         validation_errors = 0
 
-        for sample in samples:
+        for scored_index, sample in enumerate(samples):
             settle_runtime(model)
+            stage(f"scored {scored_index}/{len(samples)} sample_id={sample.sample_id}")
             config = fixed_generation_config(args.max_new_tokens)
             result = model.generate_with_metrics(
                 image=decode_image(sample.image_b64),
@@ -515,9 +651,10 @@ def run_benchmark(args: argparse.Namespace) -> dict:
 
     elapsed = time.perf_counter() - benchmark_start
     payload = {
-        "benchmark_version": "dndx_public_self_test_v1.2",
+        "benchmark_version": "dndx_public_self_test_v1.1",
         "timestamp": datetime.now().isoformat(),
         "dataset_path": str(dataset_path),
+        "model_path": str(Path(args.model_path).resolve()),
         "sample_count": len(samples),
         "seed": args.seed,
         "sample_selection": {
@@ -526,7 +663,15 @@ def run_benchmark(args: argparse.Namespace) -> dict:
             "source_sample_count": len(all_samples),
         },
         "backend": model.backend_name,
-        "generation": {"max_new_tokens": args.max_new_tokens},
+        "dtype": model.dtype_name,
+        "quantization": quantization_metadata(model.quantization_config),
+        "generation": {
+            "max_new_tokens": args.max_new_tokens,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "do_sample": False,
+            "runner": getattr(args, "generation_runner", "generate"),
+        },
         "optimization": {
             "generation_runner": getattr(args, "generation_runner", "generate"),
             "visual_pixel_budget": getattr(args, "visual_pixel_budget", None),
@@ -543,23 +688,28 @@ def run_benchmark(args: argparse.Namespace) -> dict:
                 if getattr(args, "enable_tome", False)
                 else False
             ),
-            "gdn_decode_projection_fusion": bool(
-                getattr(args, "enable_gdn_decode_projection_fusion", False)
-            ),
-            "ppu_delta_kernel": bool(getattr(args, "enable_ppu_delta_kernel", False)),
-            "ppu_delta_kernel_layers": (
-                getattr(args, "ppu_delta_kernel_layers", None)
-                if getattr(args, "enable_ppu_delta_kernel", False)
-                else None
-            ),
-            "ppu_delta_kernel_position": (
-                getattr(args, "ppu_delta_kernel_position", None)
-                if getattr(args, "enable_ppu_delta_kernel", False)
-                else None
-            ),
             "kv_chain_requested_by_cli": bool(getattr(args, "enable_kv_chain", False)),
             "kv_chain_enabled_by_env": kv_chain_env_enabled,
             "kv_chain_name": getattr(args, "kv_chain", None) if kv_chain_env_enabled else None,
+            "hybrid_cudagraph_enabled": bool(getattr(args, "enable_hybrid_cudagraph", False)),
+            "hybrid_max_cache_len": (
+                getattr(args, "hybrid_max_cache_len", None)
+                if getattr(args, "enable_hybrid_cudagraph", False)
+                else None
+            ),
+            "hybrid_prefill_backend": (
+                getattr(args, "hybrid_prefill_backend", None)
+                if getattr(args, "enable_hybrid_cudagraph", False)
+                else None
+            ),
+            "hybrid_decode_backend": (
+                getattr(args, "hybrid_decode_backend", None)
+                if getattr(args, "enable_hybrid_cudagraph", False)
+                else None
+            ),
+            # On by default; recorded here so an arm's TTFT number can never be
+            # read without knowing whether the last-logit-only prefill was live.
+            "prefill_last_logit_only": prefill_last_logit_only_enabled(),
         },
         "performance": {
             "avg_ttft_ms": round(sum(ttfts_ms) / len(ttfts_ms), 3) if ttfts_ms else None,
@@ -596,6 +746,8 @@ def main() -> None:
         json.dumps(
             {
                 "backend": payload["backend"],
+                "dtype": payload["dtype"],
+                "quantization": payload["quantization"]["quant_method"],
                 "sample_count": payload["sample_count"],
                 "avg_ttft_ms": payload["performance"]["avg_ttft_ms"],
                 "avg_throughput_tokens_per_sec": payload["performance"][
