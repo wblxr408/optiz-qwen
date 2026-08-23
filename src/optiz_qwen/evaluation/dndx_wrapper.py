@@ -71,8 +71,6 @@ class VLMModel:
         self._resolved_dtype_name = "unloaded"
         self._graph_decoder = None
         self._graph_decode_report = None
-        self._ppu_delta_report = None
-        self._ppu_delta_error = None
 
         if backend in {"auto", "transformers"}:
             try:
@@ -157,32 +155,7 @@ class VLMModel:
             self._model = self._model.to(self._resolved_device)
         self._model = self._model.eval()
         self._configure_tome()
-        self._configure_ppu_delta_kernel()
         self._tokenizer = getattr(self._processor, "tokenizer", None)
-
-    def _configure_ppu_delta_kernel(self) -> None:
-        # Delta kernel targets prefill GDN cost (measured ~12% of prefill CPU
-        # time on PPU).  Enabled by default on the harness path (env unset),
-        # disable explicitly with OPTIZ_QWEN_PPU_DELTA_KERNEL=0.
-        value = os.environ.get("OPTIZ_QWEN_PPU_DELTA_KERNEL", "").strip().lower()
-        enabled = value not in {"0", "false", "no", "off"}
-        self._ppu_delta_report = None
-        self._ppu_delta_error = None
-        if not enabled:
-            return
-        try:
-            from optiz_qwen.ppu.qwen35_delta import (
-                Qwen35PpuDeltaConfig,
-                install_qwen35_ppu_delta_kernel,
-            )
-            self._ppu_delta_report = install_qwen35_ppu_delta_kernel(
-                self._model,
-                Qwen35PpuDeltaConfig(kernel_layers=18, position="last"),
-            )
-        except Exception as exc:
-            # Delta kernel is an accelerator; never break the scoring path.
-            self._ppu_delta_report = None
-            self._ppu_delta_error = str(exc)
 
     def _configure_tome(self) -> None:
         enabled = os.environ.get("OPTIZ_QWEN_TOME_ENABLED", "").strip().lower()
@@ -248,10 +221,6 @@ class VLMModel:
             return torch.bfloat16
         if self.dtype == "fp16":
             return torch.float16
-        # Delta kernel requires bf16; harness path (env unset) defaults to it.
-        delta_enabled = os.environ.get("OPTIZ_QWEN_PPU_DELTA_KERNEL", "").strip().lower()
-        if delta_enabled not in {"0", "false", "no", "off"}:
-            return torch.bfloat16
         if str(self._resolved_device).startswith("cuda"):
             return torch.float16
         return torch.float32
@@ -488,11 +457,6 @@ class VLMModel:
                     else None
                 ),
                 "prefill_decode_runtime": runtime_stats.__dict__ if runtime_stats is not None else None,
-                "ppu_delta_kernel": (
-                    getattr(self, "_ppu_delta_report", None).__dict__
-                    if getattr(self, "_ppu_delta_report", None) is not None
-                    else None
-                ),
                 "answer_source": answer_source,
                 "raw_text": raw_text,
                 "choice_fallback": choice_fallback_meta,
